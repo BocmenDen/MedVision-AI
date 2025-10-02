@@ -1,20 +1,15 @@
-## Info for start
-### 1 step:
-
-download ZIP
-or
-```
-git clone <URL_репозитория> 
-```
-
-### 2 step:
-```
-cd dicom-uploader
-npm install express multer cors
-```
-### 3 step:
-```
-node server.js
-```
-URL for requesting the server in ZipDownload.js
-TEST SERVER in folder dicom-uploader.
+1. Установить Python версии **3.13+**.
+2. Загрузить проект (ВСТАВИТЬ ССЫЛКУ TODO) и распаковать его в выбранную папку.
+3. Открыть терминал в папке проекта или перейти в неё командой:
+   ```bash
+   cd путь_до_папки_проекта
+   ```
+4. Установить все зависимости из файла `requirements.txt` командой:
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. Запустить локальный веб-сервер командой:
+   ```bash
+   python server.py
+   ```
+6. После в консоли появиться ссылка на локальный сайт
