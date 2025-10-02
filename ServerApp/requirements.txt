@@ -4,3 +4,6 @@ pydicom
 pandas
 flask
 flask-socketio
+pylibjpeg
+pylibjpeg-libjpeg
+opencv-python

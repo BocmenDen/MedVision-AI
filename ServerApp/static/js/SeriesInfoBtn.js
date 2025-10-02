@@ -63,6 +63,7 @@ const SeriesInfoBtn = ({ seriesList = [], disabled = false }) => {
                     'series_uid': s.name || 'Неизвестно',
                     'probability_of_pathology': ai.prob ? `${(ai.prob * 100).toFixed(2)}%` : 'Н/Д',
                     'pathology_class': ai.classIndex ?? 'Н/Д',
+                    'processing_status': s.error === '' ? 'Success' : 'Failure',
                     'time_of_processing': s.duration,
                     'Количество файлов': s.files?.length || 0,
                     'Наименование признака': ai.index_to_russian ?? 'Н/Д',
@@ -138,7 +139,7 @@ const SeriesInfoBtn = ({ seriesList = [], disabled = false }) => {
                 <div className="series-export-info">
                     <div><strong>Будет экспортировано:</strong> {seriesList.length} серий</div>
                     <div className="series-export-info-small">
-                        series_uid; probability_of_pathology ; pathology_class; time_of_processing; Количество файлов; Наименование признака; Дата экспорта
+                        series_uid; probability_of_pathology ; pathology_class; processing_status; time_of_processing; Количество файлов; Наименование признака; Дата экспорта
                     </div>
                 </div>
             )}

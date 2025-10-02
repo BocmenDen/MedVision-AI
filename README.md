@@ -105,3 +105,13 @@ __При отсутствии доступа к серверу проект мо
 - Пакетный ресэмплинг
 - Надежная обработка ошибок при загрузке
 
+# Примеры серий
+
+иже приведены примеры серий КТ-сканов, используемых для обучения и тестирования модели.
+
+| Серия | Диагноз | Метка (label) |
+|-------|---------|---------------|
+| [`TestLoadCanser.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCanser.zip) | Рак | 3 |
+| [`TestLoadCovid19.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCovid19.zip) | COVID-19 | 2 |
+| [`TestLoadCap.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCap.zip) | Пневмония | 1 |
+| [`TestLoadNormal.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadNormal.zip) | Норма | 0 |

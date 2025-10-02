@@ -203,8 +203,11 @@
                     if(!Array.isArray(serverResults)) throw new Error("Некорректный ответ от сервера: " + serverResults);
                     series.forEach(s => {
                         const result = serverResults.find(r => r.name === s.name);
-                        s.model1 = result ? result.model1 : s.model1;
-                        s.duration = result.duration
+                        if(result.model1){
+                            s.model1 = result.model1;
+                            s.duration = result.duration
+                        }
+                        if(result.error) s.error = result.error
                         console.log(s.model1)
                     });
                     setSeriesList(prev => [...prev, ...series]);
@@ -291,6 +294,7 @@
                         files: series.map(item => item.content),
                         name: seriesKey,
                         duration: 0,
+                        error: '',
                         model1: {
                             "classIndex": -1,
                             "prob": 0,

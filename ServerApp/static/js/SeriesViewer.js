@@ -179,7 +179,7 @@ const SeriesViewer = ({ files, seriesName, model1, compact = false }) => {
                 {isInverted ? 'Нормальный режим' : 'Инверсия'}
             </button>
             <div className="info-ai">
-                {model1.index_to_russian} с вероятностью {model1.prob * 100}%
+                {model1.error}{model1.index_to_russian} с вероятностью {model1.prob * 100}%
             </div>
             <div style={{ padding: '10px', background: '#f8f8f8', fontSize: '12px' }}>
                 <p>• Колесо мыши - навигация по срезам</p>

@@ -43,19 +43,16 @@ def find_series(root_dir):
     return series
 
 def process_series(item_series_patch):
-    try:
-        index_to_russian = {
-            0: "Нормальные случаи",
-            1: "CAP (пневмония) случаи",
-            2: "Случай COVID-19",
-            3: "Случай рака"
-        }
-        df_results = infer_folder(item_series_patch, PATCH_MODEL_1)
-        classIndex = df_results['pred_class'].iloc[0]
-        prob = df_results.iloc[0, classIndex + 2]
-        return classIndex, prob, index_to_russian[classIndex]
-    except Exception as e:
-        return str(e)
+    index_to_russian = {
+        0: "Нормальные случаи",
+        1: "CAP (пневмония) случаи",
+        2: "Случай COVID-19",
+        3: "Случай рака"
+    }
+    df_results = infer_folder(item_series_patch, PATCH_MODEL_1)
+    classIndex = df_results['pred_class'].iloc[0]
+    prob = df_results.iloc[0, classIndex + 2]
+    return classIndex, prob, index_to_russian[classIndex]
 
 def process_zip(filename):
     temp_dir = os.path.join(TEMP_FOLDER, f"{uuid.uuid4()}")
@@ -67,17 +64,24 @@ def process_zip(filename):
     results = []
     for series_name, series_path in series_list:
         start = time.time()
-        (classIndex, prob, index_to_russian) = process_series(series_path)
-        end = time.time()
-        results.append({
-            "name": series_name,
-            "duration": float(end - start),
-            "model1":{
-                "classIndex": int(classIndex),
-                "prob": float(prob),
-                "index_to_russian": index_to_russian
-            }
-        })
+        try:
+            (classIndex, prob, index_to_russian) = process_series(series_path)
+            end = time.time()
+            results.append({
+                "name": series_name,
+                "duration": float(end - start),
+                "model1":{
+                    "classIndex": int(classIndex),
+                    "prob": float(prob),
+                    "index_to_russian": index_to_russian
+                }
+            })
+        except Exception as e:
+            results.append({
+                "name": series_name,
+                "error": str(e)
+            })
+            pass
     try:
         clear_folder(temp_dir)
         os.rmdir(temp_dir)
