@@ -63,7 +63,7 @@
 __При отсутствии доступа к серверу проект можно развернуть локально. Инструкция:__
 
 1. Установить Python версии **3.13+**.
-2. Загрузить [проект](https://github.com/BocmenDen/MedVision-AI/tree/main) и распаковать его в выбранную папку.
+2. Загрузить проект (ВСТАВИТЬ ССЫЛКУ TODO) и распаковать его в выбранную папку.
 3. Открыть терминал в папке проекта или перейти в неё командой:
    ```bash
    cd путь_до_папки_проекта
@@ -81,22 +81,17 @@ __При отсутствии доступа к серверу проект мо
 # Структура проекта
 Основные файлы
 
-* **`server.py`** — запуск Flask-сервера, маршруты.
-* **`moduleAI.py`** — загрузка модели (`model1.pth`), анализ снимков и формирование заключения.
-* **`model1.pth`** — обученная PyTorch-модель.
-* **`requirements.txt`** — зависимости.
-* **`README.md`** — инструкция по запуску.
+* **[`server.py`](https://github.com/BocmenDen/MedVision-AI/blob/main/ServerApp/server.py)** — запуск Flask-сервера, маршруты.
+* **[`moduleAI.py`](https://github.com/BocmenDen/MedVision-AI/blob/main/ServerApp/moduleAI.py)** — загрузка модели (`model1.pth`), анализ снимков и формирование заключения.
+* **[`model1.pth`](https://github.com/BocmenDen/MedVision-AI/blob/main/ServerApp/model1.pth)** — обученная PyTorch-модель.
+* **[`requirements.txt`](https://github.com/BocmenDen/MedVision-AI/blob/main/ServerApp/requirements.txt)** — зависимости.
+* **[`README.md`](https://github.com/BocmenDen/MedVision-AI/blob/main/ServerApp/README.md)** — инструкция по запуску.
 
 Интерфейс
 
-* **`templates/index.html`** — главная страница.
-* **`static/js/`** — логика просмотра DICOM (загрузка, выбор серий, просмотр).
-* **`static/styles/`** — оформление интерфейса.
-
-Рабочие директории
-
-* **`uploads/`** — загруженные пользователями архивы снимков.
-* **`temp/`** — временные файлы (распаковка и обработка).
+* **[`templates/index.html`](https://github.com/BocmenDen/MedVision-AI/blob/main/ServerApp/templates/index.html)** — главная страница.
+* **[`static/js/`](https://github.com/BocmenDen/MedVision-AI/tree/main/ServerApp/static)** — логика просмотра DICOM (загрузка, выбор серий, просмотр).
+* **[`static/styles/`](https://github.com/BocmenDen/MedVision-AI/tree/main/ServerApp/static/styles)** — оформление интерфейса.
 
 # Ключевые компоненты
 
