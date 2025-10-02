@@ -1,0 +1,6 @@
+numpy
+torch
+pydicom
+pandas
+flask
+flask-socketio

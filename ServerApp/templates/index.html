@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MedVision AI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/ai-output.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/style_win_dicom.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/menu_toggle.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/sidebar.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/style_nontif.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/style_progres.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/style_uploader.css') }}">
+
+    <!-- JS библиотеки -->
+    <script src="https://unpkg.com/cornerstone-core@2.3.0/dist/cornerstone.min.js"></script>
+    <script src="https://unpkg.com/dicom-parser/dist/dicomParser.min.js"></script>
+    <script src="https://unpkg.com/cornerstone-wado-image-loader@4.13.2/dist/cornerstoneWADOImageLoader.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+
+<body>
+    <div id="root"></div>
+    <script type="text/babel" src="{{ url_for('static', filename='js/SeriesInfoBtn.js') }}"></script>
+    <script type="text/babel" src="{{ url_for('static', filename='js/SeriesMenu.js') }}"></script>
+    <script type="text/babel" src="{{ url_for('static', filename='js/DraggableViewer.js') }}"></script>
+    <script type="text/babel" src="{{ url_for('static', filename='js/SeriesViewer.js') }}"></script>
+
+    <script type="text/babel" src="{{ url_for('static', filename='js/ZipUploader.js') }}"></script>
+    
+    
+    <script type="text/babel">
+        const { useState, useRef, useEffect, useCallback } = React;
+
+        cornerstoneWADOImageLoader.external.cornerstone = cornerstone;
+        cornerstoneWADOImageLoader.external.dicomParser = dicomParser;
+
+
+        // Главный компонент DICOM Viewer
+        const App = () => {
+            const [seriesList, setSeriesList] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            const [openViewers, setOpenViewers] = useState([]);
+            const [isMenuOpen, setIsMenuOpen] = useState(false);
+            const [uploadResult, setUploadResult] = useState(null);
+            const [progress, setProgress] = useState(0);
+            const [processedFiles, setProcessedFiles] = useState(0);
+            const [totalFiles, setTotalFiles] = useState(0);
+
+            // Эффект для управления классами body при открытии/закрытии меню
+            useEffect(() => {
+                if (isMenuOpen) {
+                    document.body.classList.add('menu-open');
+                } else {
+                    document.body.classList.remove('menu-open');
+                }
+
+                return () => {
+                    document.body.classList.remove('menu-open');
+                };
+            }, [isMenuOpen]);
+
+
+            const uploadFileToServer = async (file) => {
+
+                const CHUNK_SIZE_DEFAULT = 5 * 1024 * 1024;
+                const MAX_PARALLEL_DEFAULT = 3;
+
+                let CHUNK_SIZE = CHUNK_SIZE_DEFAULT;
+                let MAX_PARALLEL = MAX_PARALLEL_DEFAULT;
+                let taskId = null;
+                let currentFile = file;
+                let totalChunks = Math.ceil(currentFile.size / CHUNK_SIZE);
+                let queue = [];
+                let activeCount = 0;
+                const received = new Set();
+                const socket = io();
+
+                for (let i = 0; i < totalChunks; i++) queue.push(i);
+
+                return new Promise((resolve, reject) => {
+                    const finishUpload = (result) => {
+                        resolve(result);   // вернёт результат наружу
+                    };
+
+                    const failUpload = (error) => {
+                        reject(error);     // вернёт ошибку наружу
+                    };
+
+                    socket.on('upload_started', (data) => {
+                        taskId = data.task_id;
+                        if (data.chunk_size) CHUNK_SIZE = data.chunk_size;
+                        if (data.max_parallel) MAX_PARALLEL = data.max_parallel;
+                        startSendingLoop();
+                    });
+
+                    socket.on('chunk_received', (data) => {
+                        const offset = data.offset;
+                        if (!received.has(offset)) received.add(offset);
+                        activeCount--;
+                        updateProgress();
+                        startSendingLoop();
+                    });
+
+                    socket.on('missing_chunks', (data) => {
+                        for (const idx of data.missing) {
+                            if (!received.has(idx) && !queue.includes(idx)) queue.push(idx);
+                        }
+                        startSendingLoop();
+                    });
+
+                    socket.on('file_result', (data) => {
+                        finishUpload(data); //  именно отсюда уйдёт наружу результат
+                    });
+
+                    socket.emit('start_upload', {
+                        original_name: currentFile.name,
+                        total_chunks: totalChunks
+                    });
+
+                    function startSendingLoop() {
+                        while (activeCount < MAX_PARALLEL && queue.length) {
+                            const chunkIndex = queue.shift();
+                            sendChunk(chunkIndex).catch(failUpload);
+                            activeCount++;
+                        }
+                    }
+
+                    async function sendChunk(index) {
+                        try {
+                            const offset = index * CHUNK_SIZE;
+                            const chunk = currentFile.slice(offset, offset + CHUNK_SIZE);
+                            const arrayBuffer = await chunk.arrayBuffer();
+
+                            socket.emit('upload_chunk', {
+                                task_id: taskId,
+                                chunk: new Uint8Array(arrayBuffer),
+                                offset: index
+                            });
+                        } catch (err) {
+                            failUpload(err);
+                        }
+                    }
+
+                    function updateProgress() {
+                        const percent = Math.round((received.size / totalChunks) * 100);
+                    }
+                });
+            };
+
+            const uploadFileViaPOST = async (file) => {
+                return new Promise(async (resolve, reject) => {
+                    try {
+                        const formData = new FormData();
+                        formData.append("file", file);
+
+                        // Отправляем POST запрос на Flask /upload
+                        const response = await fetch("/upload", {
+                            method: "POST",
+                            body: formData
+                        });
+
+                        if (!response.ok) {
+                            const text = await response.text();
+                            reject(`Ошибка сервера: ${response.status} - ${text}`);
+                            return;
+                        }
+
+                        const result = await response.json();
+                        resolve(result); // Вернёт результат наружу
+                    } catch (err) {
+                        reject(err); // Вернёт ошибку наружу
+                    }
+                });
+            };
+
+
+            const handleZipLoad = async (zip, file) => {
+                setIsLoading(true);
+                setUploadResult(null);
+                setProgress(0);
+                setTotalFiles(0);
+
+                try {
+                    let serverResults;
+                    if({{IS_POST}}){
+                        serverResults = await uploadFileViaPOST(file);
+                    } else {
+                        serverResults = await uploadFileToServer(file);
+                    }
+                    setProcessedFiles(0);
+                    const series = await processZip(zip, (current, total, currentFile, totalFiles) => {
+                        setProgress(Math.round((current / total) * 100));
+                        setProcessedFiles(current);
+                        setTotalFiles(totalFiles);
+                    });
+                    if(!Array.isArray(serverResults)) throw new Error("Некорректный ответ от сервера: " + serverResults);
+                    series.forEach(s => {
+                        const result = serverResults.find(r => r.name === s.name);
+                        s.model1 = result ? result.model1 : s.model1;
+                        s.duration = result.duration
+                        console.log(s.model1)
+                    });
+                    setSeriesList(prev => [...prev, ...series]);
+
+                    setUploadResult({
+                        success: true,
+                        message: `Успешно загружено ${series.length} серий`,
+                        seriesCount: series.length,
+                        totalFiles: series.reduce((total, s) => total + s.files.length, 0)
+                    });
+
+                    const viewers = series.map((seriesItem, index) => ({
+                        id: Date.now() + index,
+                        series: seriesItem,
+                        position: { x: 100 + index * 50, y: 100 + index * 50 },
+                        isOpen: true,
+                        zIndex: 1000 + index
+                    }));
+                    setOpenViewers(viewers);
+
+                } catch (error) {
+                    console.error('Error processing ZIP:', error);
+                    setUploadResult({
+                        success: false,
+                        message: `Ошибка загрузки: ${error.message}`
+                    });
+                } finally {
+                    setIsLoading(false);
+                    setProgress(100);
+                }
+            };
+
+            const processZip = async (zip, onProgress) => {
+                const unsortedSeriesData = {};
+                const promises = [];
+
+                const allFiles = Object.keys(zip.files).filter(relativePath => !zip.files[relativePath].dir);
+                let processedFiles = 0;
+                const totalFilesCount = allFiles.length;
+
+                //прогресс: start
+                if (onProgress) {
+                    onProgress(0, totalFilesCount, 0, totalFilesCount);
+                }
+
+                allFiles.forEach((relativePath) => {
+                    const zipEntry = zip.files[relativePath];
+                    const pathParts = relativePath.split('/').filter(part => part !== '');
+                    const filename = pathParts.pop();
+                    const seriesKey = pathParts.pop() || 'default';
+
+                    if (!unsortedSeriesData[seriesKey]) {
+                        unsortedSeriesData[seriesKey] = [];
+                    }
+
+                    const promise = zipEntry.async('blob').then(content => {
+                        unsortedSeriesData[seriesKey].push({
+                            filename,
+                            content,
+                            path: relativePath,
+                            size: content.size
+                        });
+
+                        //прогресс после обработки каждого файла
+                        processedFiles++;
+                        if (onProgress) {
+                            onProgress(processedFiles, totalFilesCount, processedFiles, totalFilesCount);
+                        }
+                    });
+                    promises.push(promise);
+                });
+
+                await Promise.all(promises);
+
+                console.log('Processed series:', Object.keys(unsortedSeriesData));
+                Object.entries(unsortedSeriesData).forEach(([seriesKey, files]) => {
+                    console.log(`Series ${seriesKey}: ${files.length} files`);
+                });
+
+                return Object.entries(unsortedSeriesData).map(([seriesKey, series]) => {
+                    series.sort((a, b) => a.filename.localeCompare(b.filename));
+                    return {
+                        key: seriesKey,
+                        files: series.map(item => item.content),
+                        name: seriesKey,
+                        duration: 0,
+                        model1: {
+                            "classIndex": -1,
+                            "prob": 0,
+                            "index_to_russian": ''
+                        }
+                    };
+                });
+            };
+
+            const openViewer = (series) => {
+                const newViewer = {
+                    id: Date.now(),
+                    series: series,
+                    position: { x: 100 + openViewers.length * 30, y: 100 + openViewers.length * 30 },
+                    isOpen: true,
+                    zIndex: 1000 + openViewers.length
+                };
+                setOpenViewers(prev => [...prev, newViewer]);
+            };
+
+            const closeViewer = (viewerId) => {
+                setOpenViewers(prev => prev.filter(viewer => viewer.id !== viewerId));
+            };
+
+            const updateViewerPosition = (viewerId, newPosition) => {
+                setOpenViewers(prev => prev.map(viewer =>
+                    viewer.id === viewerId
+                        ? { ...viewer, position: newPosition }
+                        : viewer
+                ));
+            };
+
+            const bringToFront = (viewerId) => {
+                setOpenViewers(prev => {
+                    const maxZIndex = Math.max(...prev.map(v => v.zIndex));
+                    return prev.map(viewer =>
+                        viewer.id === viewerId
+                            ? { ...viewer, zIndex: maxZIndex + 1 }
+                            : viewer
+                    );
+                });
+            };
+
+            const toggleMenu = () => {
+                setIsMenuOpen(prev => !prev);
+            };
+
+            return (
+                <div className="bodya">
+                    <SeriesMenu
+                        seriesList={seriesList}
+                        onOpenViewer={openViewer}
+                        isMenuOpen={isMenuOpen}
+                        onToggleMenu={toggleMenu}
+                    />
+
+                    <div className="seriesContainers">
+                        <div className="naming">
+                            <h2>MedVision AI</h2>
+                        </div>
+                        <div className="backgr">
+                            <div className="ai-output">
+                                <h2>Анализ DICOM файлов</h2>
+
+                                {/* Компонент загрузки внутри ai-output */}
+                                <div className="upload-section">
+                                    <ZipUploader
+                                        onZipLoad={handleZipLoad}
+                                        isLoading={isLoading}
+                                    />
+                                </div>
+
+                                {/* Индикатор загрузки с прогрессом */}
+                                {isLoading && (
+                                    <div className="loading-section">
+                                        <p>Подождите выполняется загрузка и обработка архива, данные появяться чуть позже...</p>
+                                    </div>
+                                )}
+
+                                {/* Результат загрузки */}
+                                {uploadResult && (
+                                    <div className={`upload-result ${uploadResult.success ? 'success' : 'error'}`}>
+                                        <h3>{uploadResult.success ? 'Загрузка завершена' : '❌ Ошибка загрузки'}</h3>
+                                        <p>{uploadResult.message}</p>
+                                        {uploadResult.success && (
+                                            <div className="upload-details">
+                                                <p><strong>Количество серий:</strong> {uploadResult.seriesCount}</p>
+                                                <p><strong>Всего файлов:</strong> {uploadResult.totalFiles}</p>
+                                                <p>Серии теперь доступны в боковом меню для просмотра.</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {/* Исходный текст (показывается только при отсутствии загрузки) */}
+                                {!isLoading && !uploadResult && (
+                                    <div className="default-content">
+                                        <p>Загрузите ZIP архив с DICOM файлами для анализа.</p>
+                                        <p>После загрузки здесь будет отображаться результат обработки и станут доступны серии для просмотра.</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Окна просмотра */}
+                    {openViewers.map((viewer) => (
+                        <DraggableViewer
+                            key={viewer.id}
+                            viewer={viewer}
+                            onClose={() => closeViewer(viewer.id)}
+                            onPositionUpdate={(newPos) => updateViewerPosition(viewer.id, newPos)}
+                            onFocus={() => bringToFront(viewer.id)}
+                        />
+                    ))}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>

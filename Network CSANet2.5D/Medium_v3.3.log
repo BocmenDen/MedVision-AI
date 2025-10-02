@@ -1,0 +1,2144 @@
+2025-10-01 22:47:20,561 | INFO | === START OF SCRIPT CODE ===
+2025-10-01 22:47:20,561 | INFO | 
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+
+def pad_depth_to(t: torch.Tensor, target_d: int) -> torch.Tensor:
+    d = t.shape[1]
+    if d == target_d:
+        return t
+    pad_back = target_d - d
+    # pad: (W_left, W_right, H_left, H_right, D_left, D_right)
+    return F.pad(t, (0, 0, 0, 0, 0, pad_back), mode='constant', value=0.0)
+
+def collate_variable_depth(batch):
+    xs, ys = zip(*batch)                     # xs: (1,D,H,W)
+    max_d = max(x.shape[1] for x in xs)
+    xs_padded = [pad_depth_to(x, max_d) for x in xs]
+    x_batch = torch.stack(xs_padded, dim=0)  # (B,1,maxD,H,W)
+    y_batch = torch.stack(ys, dim=0)
+    return x_batch, y_batch
+
+    # === Вспомогательная функция: батчевый ресэмплинг на GPU (правка №1) ===
+def gpu_resample(x):
+    # x: (B, 1, D, H, W) на device
+    return F.interpolate(
+        x, size=(TARGET_SLICES, TARGET_HW, TARGET_HW),
+        mode='trilinear', align_corners=False
+    )
+# === Глобальные целевые размеры для интерполяции (используются на GPU) ===
+TARGET_SLICES = 64
+TARGET_HW = 512
+
+def preprocess_scan(scan):
+    """
+    УПРОЩЕНО: только нормализация в [0,1], БЕЗ интерполяции.
+    Интерполяция теперь выполняется пакетно на GPU в тренировочном/валид. цикле.
+    """
+    scan = scan.astype(np.float32)
+    scan -= scan.min()
+    scan /= (scan.max() + 1e-5)
+    return torch.from_numpy(scan)  # (D, H, W)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# SE блок для 3D
+class SE3D(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc1 = nn.Linear(channels, channels // reduction)
+        self.fc2 = nn.Linear(channels // reduction, channels)
+
+    def forward(self, x):
+        b, c, d, h, w = x.shape
+        y = x.view(b, c, -1).mean(dim=2)  # (b, c)
+        y = F.relu(self.fc1(y))
+        y = torch.sigmoid(self.fc2(y))
+        y = y.view(b, c, 1, 1, 1)
+        return x * y
+
+# Residual блок с SE
+class ResidualBlock3D(nn.Module):
+    def __init__(self, in_ch, out_ch, use_se=True):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_ch),
+        )
+        self.skip = nn.Conv3d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+        self.relu = nn.ReLU(inplace=True)
+        self.use_se = use_se
+        if use_se:
+            self.se = SE3D(out_ch)
+
+    def forward(self, x):
+        out = self.conv(x)
+        out = out + self.skip(x)
+        out = self.relu(out)
+        if self.use_se:
+            out = self.se(out)
+        return out
+
+# Cross-Slice Attention (CSA)
+class CSABlock(nn.Module):
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        x2 = self.norm1(x)
+        attn_out, _ = self.attn(x2, x2, x2)
+        x = x + attn_out
+        x2 = self.norm2(x)
+        x = x + self.mlp(x2)
+        return x
+
+# CSA-Net 2.5D
+class CSANet2_5D(nn.Module):
+    def __init__(self, in_channels=1, out_channels=4, d_model=128, num_heads=8, num_layers=2):
+        super().__init__()
+        # 2.5D CNN Backbone
+        self.enc1 = ResidualBlock3D(in_channels, 16)
+        self.pool1 = nn.MaxPool3d(kernel_size=(1,2,2), stride=(1,2,2))
+        self.enc2 = ResidualBlock3D(16, 32)
+        self.pool2 = nn.MaxPool3d(kernel_size=(1,2,2), stride=(1,2,2))
+        self.enc3 = ResidualBlock3D(32, 48)
+        self.pool3 = nn.MaxPool3d(kernel_size=(1,2,2), stride=(1,2,2))
+        self.enc4 = ResidualBlock3D(48, d_model)
+
+        self.csa_layers = nn.ModuleList([CSABlock(d_model, num_heads=num_heads) for _ in range(num_layers)])
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.norm = nn.LayerNorm(d_model)
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(d_model // 2, out_channels)
+        )
+
+    def forward(self, x):
+        # x: (B, 1, D, H, W)
+        x = self.enc1(x); x = self.pool1(x)
+        x = self.enc2(x); x = self.pool2(x)
+        x = self.enc3(x); x = self.pool3(x)
+        x = self.enc4(x)  # (B, d_model, D', H', W')
+
+        # усредняем по H,W \u2192 токены = срезы
+        x = x.mean(dim=(3, 4))        # (B, d_model, D')
+        x = x.permute(0, 2, 1)        # (B, D', d_model)
+
+        # Добавляем CLS-токен
+        cls_tokens = self.cls_token.expand(x.size(0), 1, -1)  # (B, 1, d_model)
+        x = torch.cat([cls_tokens, x], dim=1)                 # (B, 1 + D', d_model)
+
+        # CSA
+        for layer in self.csa_layers:
+            x = layer(x)
+
+        x = self.norm(x)
+        cls_final = x[:, 0, :]        # (B, d_model)
+        logits = self.head(cls_final) # (B, out_channels)
+        return logits
+
+
+class LungCTDataset(Dataset):
+    def __init__(self, df, data_dir, target_slices=TARGET_SLICES, transform=None):
+        self.df = df
+        self.data_dir = data_dir
+        self.target_slices = target_slices
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        file_path = os.path.normpath(os.path.join(self.data_dir, row['file']))
+        try:
+            with np.load(file_path, allow_pickle=True) as npz:
+                scan_key = list(npz.keys())[0]
+                scan = np.array(npz[scan_key], dtype=np.float32)
+
+            if scan.ndim != 3:
+                raise ValueError(f"Expected 3D array, got shape {scan.shape}")
+
+            # ТОЛЬКО нормализация, БЕЗ интерполяции (ресэмпл будет на GPU для батча)
+            scan = preprocess_scan(scan)          # (D, H, W) -> Tensor
+            scan = scan.unsqueeze(0).float()      # (1, D, H, W)
+
+            label = torch.tensor(int(row['label']), dtype=torch.long)
+            return scan, label
+
+        except Exception as e:
+            print(f"[DATA ERROR] Failed to load {file_path}: {e}")
+            dummy_scan = torch.zeros((1, self.target_slices, TARGET_HW, TARGET_HW), dtype=torch.float32)
+            dummy_label = torch.tensor(0, dtype=torch.long)
+            return dummy_scan, dummy_label
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --- Weighted Cross-Entropy Loss ---
+def get_weighted_ce(weights=None):
+    return nn.CrossEntropyLoss(weight=weights)
+
+# --- Unified Focal Loss (устойчивая версия) ---
+class UnifiedFocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits, targets):
+        logp = F.log_softmax(logits, dim=1)
+        nll = F.nll_loss(logp, targets, reduction='none', weight=self.alpha)
+        p = torch.exp(-nll)
+        loss = ((1 - p) ** self.gamma) * nll
+        return loss.mean()
+
+# --- Combined Loss ---
+class CombinedLoss(nn.Module):
+    def __init__(self, weights=None, gamma=2.0, alpha=None, ce_weight=0.5, focal_weight=0.5):
+        super().__init__()
+        self.ce_loss = get_weighted_ce(weights)
+        self.focal_loss = UnifiedFocalLoss(gamma=gamma, alpha=alpha)
+        self.ce_weight = ce_weight
+        self.focal_weight = focal_weight
+
+        print("=== CombinedLoss initialized ===")
+        if weights is not None:
+            print("CE class weights (mean\u22481):", weights)
+        if alpha is not None:
+            print("Focal alpha weights:", alpha)
+
+    def forward(self, logits, targets):
+        loss_ce = self.ce_loss(logits, targets)
+        loss_focal = self.focal_loss(logits, targets)
+        loss_combined = self.ce_weight * loss_ce + self.focal_weight * loss_focal
+        return loss_combined, loss_ce, loss_focal
+
+# ===== Метрики предсказаний (гистограмма, уверенность, энтропия, per-class acc) =====
+# ===== Метрики предсказаний (GPU-friendly) =====
+def init_pred_stats(num_classes: int, device=None):
+    device = device or torch.device("cpu")
+    return {
+        "n": 0,
+        "correct": 0,
+        "hist": torch.zeros(num_classes, dtype=torch.long, device=device),
+        "per_class_corr": torch.zeros(num_classes, dtype=torch.long, device=device),
+        "per_class_total": torch.zeros(num_classes, dtype=torch.long, device=device),
+        "conf_sum": torch.tensor(0.0, device=device),
+        "ent_sum":  torch.tensor(0.0, device=device),
+    }
+
+@torch.no_grad()
+def update_pred_stats(stats: dict, logits: torch.Tensor, targets: torch.Tensor, num_classes: int):
+    # всё на ОДНОМ device (GPU), без .cpu() в батч-цикле
+    probs = torch.softmax(logits, dim=1)
+    logp  = torch.log_softmax(logits, dim=1)
+    conf, pred = probs.max(dim=1)
+    ent = -(probs * logp).sum(dim=1)
+
+    stats["n"] += targets.numel()
+    stats["correct"] += (pred == targets).sum().item()
+
+    stats["hist"] += torch.bincount(pred, minlength=num_classes)
+    stats["per_class_total"] += torch.bincount(targets, minlength=num_classes)
+
+    pc_mask = (pred == targets)
+    stats["per_class_corr"] += torch.bincount(targets[pc_mask], minlength=num_classes)
+
+    stats["conf_sum"] += conf.sum()
+    stats["ent_sum"]  += ent.sum()
+
+def finalize_pred_stats(stats: dict):
+    # только здесь переносим на CPU
+    n = max(stats["n"], 1)
+    mean_conf = (stats["conf_sum"] / n).item()
+    mean_ent  = (stats["ent_sum"]  / n).item()
+    overall_acc = 100.0 * stats["correct"] / n
+
+    per_class_total = stats["per_class_total"].clamp_min(1)
+    per_class_acc = (stats["per_class_corr"].float() / per_class_total.float()) * 100.0
+
+    return {
+        "overall_acc": overall_acc,
+        "hist": stats["hist"].detach().cpu(),
+        "mean_conf": mean_conf,
+        "mean_ent": mean_ent,
+        "per_class_acc": per_class_acc.detach().cpu(),
+    }
+
+def pretty_print_pred_stats(name: str, stats_dict: dict, class_names=None, log_fn=print):
+    hist = stats_dict["hist"].numpy()
+    total = hist.sum()
+    distr = (hist / max(total, 1) * 100.0)
+    if class_names is None:
+        class_names = [f"class_{i}" for i in range(len(hist))]
+
+    bar = " | ".join([f"{cls}: {int(cnt)} ({p:.1f}%)"
+                      for cls, cnt, p in zip(class_names, hist, distr)])
+    log_fn(
+        f"[{name}] acc={stats_dict['overall_acc']:.2f}% | "
+        f"mean_conf={stats_dict['mean_conf']:.3f} | mean_entropy={stats_dict['mean_ent']:.3f}\n"
+        f"[{name}] pred_hist: {bar}\n"
+        f"[{name}] per-class acc: " +
+        " | ".join([f"{cls}: {a:.1f}%" for cls, a in zip(class_names, stats_dict["per_class_acc"].numpy())])
+    )
+
+
+def main():
+    import pandas as pd
+    import torch
+    from torch.utils.data import DataLoader
+    from sklearn.model_selection import train_test_split
+    import sys
+    import os
+    import logging
+    import torch.backends.cudnn as cudnn
+    # === TF32 ===
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    cudnn.benchmark = True
+
+    # === Настройка логирования ===
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    log_filename = f"{script_name}.log"
+
+    logging.basicConfig(
+        filename=log_filename,
+        filemode='w',
+        format='%(asctime)s | %(levelname)s | %(message)s',
+        level=logging.INFO
+    )
+
+    def log(msg):
+        print(msg)
+        logging.info(msg)
+
+    # === Логирование всего кода скрипта в начале ===
+    try:
+        with open(__file__, 'r', encoding='utf-8') as f:
+            script_code = f.read()
+        logging.info("=== START OF SCRIPT CODE ===")
+        logging.info("\n" + script_code)
+        logging.info("=== END OF SCRIPT CODE ===\n")
+    except Exception as e:
+        log(f"[LOGGING ERROR] Cannot read script code: {e}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Используемое устройство:", device)
+
+    # \u2705 AMP включаем только на CUDA
+    USE_AMP = (device.type == "cuda")
+    scaler = torch.amp.GradScaler(enabled=USE_AMP)
+
+    def amp_autocast():
+        # единое место: без FutureWarning
+        return torch.amp.autocast("cuda", dtype=torch.float16, enabled=USE_AMP)
+
+
+    data_dir = r"C:/Users/Admin/PycharmProjects/PythonProject2/Processed_old"
+    csv_file = "C:/Users/Admin/PycharmProjects/PythonProject2/Processed_old/labels.csv"  # твой CSV с колонками ['patient_path','label']
+
+    df = pd.read_csv(csv_file)
+    print(df.head())
+    print("CSV загружен")
+
+    df_train, df_temp = train_test_split(df, stratify=df["label"], test_size=0.2, random_state=42)
+    df_val, df_test = train_test_split(df_temp, stratify=df_temp["label"], test_size=0.1, random_state=42)
+    print(f"Train: {len(df_train)}, Val: {len(df_val)}, Test: {len(df_test)}")
+    sys.stdout.flush()
+
+
+    train_dataset = LungCTDataset(df_train, data_dir, target_slices=TARGET_SLICES)
+    val_dataset = LungCTDataset(df_val, data_dir, target_slices=TARGET_SLICES)
+    test_dataset = LungCTDataset(df_test, data_dir, target_slices=TARGET_SLICES)
+
+    # === Тюнинг DataLoader (правка №2) ===
+    batch_size = 3
+    num_workers = min(8, os.cpu_count() - 2 if os.cpu_count() else 4)
+    prefetch_factor = 2
+
+    from torch.utils.data import WeightedRandomSampler
+
+    # частоты классов в train
+    train_label_counts = df_train['label'].value_counts().sort_index()
+    num_classes = int(train_label_counts.index.max() + 1)
+
+    # веса классов = 1 / частота
+    class_weights_sampler = 1.0 / (train_label_counts.values + 1e-6)
+
+    # веса для каждого сэмпла
+    sample_weights = df_train['label'].map(lambda y: class_weights_sampler[int(y)]).values
+    sample_weights = torch.tensor(sample_weights, dtype=torch.double)
+
+    # СДЕЛАЕМ БАЛАНСИРОВАННУЮ ДЛИНУ ЭПОХИ:
+    max_count = int(train_label_counts.max())
+    epoch_len = max_count * num_classes  # одинаковое ожидаемое число на класс за эпоху
+
+    train_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=epoch_len,  # <-- вместо len(sample_weights)
+        replacement=True
+    )
+
+    pin_mem = (device.type == "cuda")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_mem,
+        persistent_workers=True,
+        prefetch_factor=prefetch_factor,
+        collate_fn=collate_variable_depth,
+    )
+
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_mem,
+        persistent_workers=True, prefetch_factor=prefetch_factor,
+        collate_fn=collate_variable_depth,
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_mem,
+        persistent_workers=True, prefetch_factor=prefetch_factor,
+        collate_fn=collate_variable_depth,
+    )
+
+    # Проверим распределение меток и допустимый диапазон
+    print("Label distribution:\n", df["label"].value_counts().sort_index())
+    num_classes = int(df['label'].max()) + 1
+    assert df["label"].min() >= 0 and df["label"].max() < num_classes, \
+        f"Labels must be in [0, {num_classes - 1}]"
+    class_names = [str(c) for c in range(num_classes)]
+
+    # === Модель / оптимизатор / шедулер ===
+    model = CSANet2_5D(out_channels=num_classes).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6
+    )
+
+    def class_balanced_weights(counts, beta=0.999):  # counts: torch.float32 [C] на device
+        eff_num = 1.0 - torch.pow(beta, counts)
+        w = (1.0 - beta) / eff_num.clamp_min(1e-6)
+        return w * (w.numel() / w.sum())  # нормируем так, чтобы среднее \u2248 1
+
+    class_counts = torch.tensor(
+        df_train['label'].value_counts().sort_index().values,
+        dtype=torch.float32, device=device
+    )
+    cb_w = class_balanced_weights(class_counts, beta=0.999)
+
+    criterion = CombinedLoss(
+        weights=cb_w,  # -> CE
+        alpha=cb_w,  # -> Focal
+        gamma=1.5,  # начни с 1.5; если класс всё ещё «тонет», подними до 2.0
+        ce_weight=0.5,
+        focal_weight=0.5
+    )
+
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_ce": [],
+        "val_focal": [],
+        "val_acc": [],
+    }
+
+    # === Функция оценки модели ===
+    from sklearn.metrics import confusion_matrix, classification_report
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import torch
+
+    def evaluate(model, dataloader, device, class_names=None):
+        model.eval()
+        correct, total = 0, 0
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
+            for x, y in dataloader:
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                x = gpu_resample(x)
+
+                with amp_autocast():
+                    out = model(x)
+
+                _, pred = out.max(1)
+                total += y.size(0)
+                correct += (pred == y).sum().item()
+                all_preds.append(pred.cpu())
+                all_labels.append(y.cpu())
+
+        acc = 100 * correct / total
+        log(f"Test Accuracy: {acc:.2f}%")
+
+        # --- Confusion Matrix и Classification Report ---
+        all_preds = torch.cat(all_preds).numpy()
+        all_labels = torch.cat(all_labels).numpy()
+
+        cm = confusion_matrix(all_labels, all_preds)
+        report = classification_report(all_labels, all_preds, target_names=class_names, digits=4)
+
+        log("\nClassification Report:\n" + report)
+
+        # Отрисовка confusion matrix
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+        plt.xlabel("Predicted")
+        plt.ylabel("Actual")
+        plt.title("Confusion Matrix")
+        plt.tight_layout()
+        plt.show()
+
+        return acc
+
+    # === Оптимизатор и функция потерь ===
+    # AdamW + weight decay для лучшей регуляризации
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+
+
+    # --- Автоматический расчет и НОРМАЛИЗАЦИЯ весов классов для CE ---
+    class_counts = df_train['label'].value_counts().sort_index().values  # [N0, N1, ...]
+    class_counts = torch.tensor(class_counts, dtype=torch.float32, device=device)
+
+    ce_weights = 1.0 / (class_counts + 1e-6)  # обратная пропорция
+    # нормализуем так, чтобы среднее было \u2248 1 (масштаб CE будет сопоставим с Focal)
+    ce_weights = ce_weights * (ce_weights.numel() / ce_weights.sum())
+
+    # === ВКЛЮЧЕНИЕ FOCAL ПОСЛЕ N ЭПОХ ===
+    EPOCH_FOCAL_START = 10  # первые 10 эпох — без Focal
+    best_val_acc = 0.0
+
+    class_names = [str(c) for c in range(num_classes)]
+
+    # === Цикл обучения ===
+    NUM_EPOCHS = 400
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        running_loss = 0.0
+        running_ce = 0.0
+        running_focal = 0.0
+        correct = 0
+        total = 0
+        # === Статистика предсказаний на train ===
+        stats_train = init_pred_stats(num_classes, device=device)
+
+        use_focal = (epoch + 1) >= EPOCH_FOCAL_START
+
+        for i, (x, y) in enumerate(train_loader):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            # Пакетная интерполяция на GPU (правка №1)
+            x = gpu_resample(x)
+            optimizer.zero_grad(set_to_none=True)
+
+            with amp_autocast():
+                out = model(x)
+                # CE всегда считаем
+                loss_ce = criterion.ce_loss(out, y)
+                if use_focal:
+                    # Focal только после EPOCH_FOCAL_START
+                    loss_focal = criterion.focal_loss(out, y)
+                    loss = 0.5 * loss_ce + 0.5 * loss_focal
+                else:
+                    # до старта Focal пишем ноль для аккуратной статистики
+                    loss_focal = torch.tensor(0.0, device=out.device)
+                    loss = loss_ce
+
+            # обновляем статистику предсказаний для train
+            update_pred_stats(stats_train, out, y, num_classes)
+
+            if USE_AMP:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            running_loss += loss.item()
+            running_ce += loss_ce.item()
+            running_focal += loss_focal.item()
+
+            _, predicted = out.max(1)
+            total += y.size(0)
+            correct += (predicted == y).sum().item()
+
+            # Вывод прогресса батчей
+            print(f"\rEpoch {epoch + 1}/{NUM_EPOCHS} Batch {i + 1}/{len(train_loader)} "
+                  f"Loss: {running_loss / (i + 1):.4f} "
+                  f"CE: {running_ce / (i + 1):.4f} "
+                  f"Focal: {running_focal / (i + 1):.4f} "
+                  f"Acc: {100 * correct / total:.2f}%", end="", flush=True)
+
+        train_loss_avg = running_loss / len(train_loader)
+        train_acc = 100 * correct / total
+        log(f"\n--- Epoch {epoch + 1} finished: Avg Loss: {train_loss_avg:.4f}, Avg Acc: {train_acc:.2f}% ---")
+
+        # === Итоги по train-предсказаниям ===
+        train_stats = finalize_pred_stats(stats_train)
+        pretty_print_pred_stats("Train", train_stats, class_names, log_fn=log)
+
+        # === Валидация ===
+        model.eval()
+        val_loss, val_ce, val_focal = 0.0, 0.0, 0.0
+        val_correct = 0
+        val_total = 0
+
+        # >>> ДОБАВИТЬ: собираем валид-статы предсказаний
+        stats_val = init_pred_stats(num_classes, device=device)
+
+        with torch.no_grad():
+            for i, (x_val, y_val) in enumerate(val_loader):
+                x_val = x_val.to(device, non_blocking=True)
+                y_val = y_val.to(device, non_blocking=True)
+
+                x_val = gpu_resample(x_val)
+
+                with amp_autocast():
+                    out_val = model(x_val)
+                    loss_val, loss_ce_val, loss_focal_val = criterion(out_val, y_val)
+
+                # >>> ДОБАВИТЬ: обновляем валид-статистики
+                update_pred_stats(stats_val, out_val, y_val, num_classes)
+
+                val_loss += loss_val.item()
+                val_ce += loss_ce_val.item()
+                val_focal += loss_focal_val.item()
+
+                _, pred_val = out_val.max(1)
+                val_total += y_val.size(0)
+                val_correct += (pred_val == y_val).sum().item()
+
+        val_loss_avg = val_loss / len(val_loader)
+        val_ce_avg = val_ce / len(val_loader)
+        val_focal_avg = val_focal / len(val_loader)
+        val_acc = 100 * val_correct / val_total
+
+        history["epoch"].append(epoch + 1)
+        history["train_loss"].append(train_loss_avg)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss_avg)
+        history["val_ce"].append(val_ce_avg)
+        history["val_focal"].append(val_focal_avg)
+        history["val_acc"].append(val_acc)
+
+        scheduler.step(val_loss_avg)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # >>> ДОБАВИТЬ: печать гистограммы предсказаний и per-class acc для валидации
+        val_stats = finalize_pred_stats(stats_val)
+        pretty_print_pred_stats("Val", val_stats, class_names, log_fn=log)
+
+        log(f"Validation Loss: {val_loss_avg:.4f} | CE: {val_ce_avg:.4f} | "
+            f"Focal: {val_focal_avg:.4f} | Acc: {val_acc:.2f}% | LR: {current_lr:.2e}")
+
+        # Получаем имя скрипта без расширения
+        script_name = os.path.splitext(os.path.basename(__file__))[0]
+
+        # === Сохранение лучшей модели ===
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            # Формируем имя файла: <имя_скрипта>_<валид_аккуратность>.pth
+            best_model_path = f"{script_name}_{best_val_acc:.2f}.pth"
+            torch.save(model.state_dict(), best_model_path)
+            log(f"\u2705 New best model saved: {best_model_path}")
+
+    # === Тестирование ===
+    log("\n=== Final Evaluation on Test Set ===")
+    class_names = [str(c) for c in sorted(df['label'].unique())]
+    evaluate(model, test_loader, device, class_names)
+
+    import matplotlib.pyplot as plt
+
+    # общая функция сглаживания (по желанию)
+    def smooth(y, k=1):
+        if k <= 1 or k > len(y):
+            return y
+        import numpy as np
+        y = np.array(y, dtype=float)
+        kernel = np.ones(k) / k
+        return np.convolve(y, kernel, mode="valid")
+
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    png_path = f"{script_name}_training_curves.png"
+
+    epochs = history["epoch"]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, history["train_loss"], label="Train Loss")
+    plt.plot(epochs, history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss Curves")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, history["train_acc"], label="Train Acc")
+    plt.plot(epochs, history["val_acc"], label="Val Acc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Accuracy Curves")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150)
+    plt.show()
+
+    log(f"\U0001f4c8 Saved training curves to: {png_path}")
+
+
+if __name__ == "__main__":
+    main()
+2025-10-01 22:47:20,561 | INFO | === END OF SCRIPT CODE ===
+
+2025-10-01 22:52:56,920 | INFO | 
+--- Epoch 1 finished: Avg Loss: 1.2635, Avg Acc: 37.24% ---
+2025-10-01 22:52:56,926 | INFO | [Train] acc=37.24% | mean_conf=0.354 | mean_entropy=1.324
+[Train] pred_hist: 0: 106 (18.0%) | 1: 340 (57.8%) | 2: 29 (4.9%) | 3: 113 (19.2%)
+[Train] per-class acc: 0: 21.2% | 1: 65.2% | 2: 6.4% | 3: 54.6%
+2025-10-01 22:53:09,055 | INFO | [Val] acc=50.00% | mean_conf=0.403 | mean_entropy=1.266
+[Val] pred_hist: 0: 1 (1.1%) | 1: 51 (58.0%) | 2: 0 (0.0%) | 3: 36 (40.9%)
+[Val] per-class acc: 0: 7.7% | 1: 90.9% | 2: 0.0% | 3: 100.0%
+2025-10-01 22:53:09,055 | INFO | Validation Loss: 0.7867 | CE: 1.1155 | Focal: 0.4578 | Acc: 50.00% | LR: 1.00e-04
+2025-10-01 22:53:09,068 | INFO | \u2705 New best model saved: Medium_v3.3_50.00.pth
+2025-10-01 22:55:33,632 | INFO | 
+--- Epoch 2 finished: Avg Loss: 1.1549, Avg Acc: 44.05% ---
+2025-10-01 22:55:33,633 | INFO | [Train] acc=44.05% | mean_conf=0.432 | mean_entropy=1.229
+[Train] pred_hist: 0: 151 (25.7%) | 1: 274 (46.6%) | 2: 32 (5.4%) | 3: 131 (22.3%)
+[Train] per-class acc: 0: 36.7% | 1: 59.5% | 2: 6.5% | 3: 70.5%
+2025-10-01 22:55:44,247 | INFO | [Val] acc=65.91% | mean_conf=0.502 | mean_entropy=1.130
+[Val] pred_hist: 0: 29 (33.0%) | 1: 10 (11.4%) | 2: 13 (14.8%) | 3: 36 (40.9%)
+[Val] per-class acc: 0: 84.6% | 1: 45.5% | 2: 29.0% | 3: 100.0%
+2025-10-01 22:55:44,247 | INFO | Validation Loss: 0.6740 | CE: 0.9372 | Focal: 0.4108 | Acc: 65.91% | LR: 1.00e-04
+2025-10-01 22:55:44,255 | INFO | \u2705 New best model saved: Medium_v3.3_65.91.pth
+2025-10-01 22:57:56,188 | INFO | 
+--- Epoch 3 finished: Avg Loss: 1.1649, Avg Acc: 46.09% ---
+2025-10-01 22:57:56,188 | INFO | [Train] acc=46.09% | mean_conf=0.470 | mean_entropy=1.174
+[Train] pred_hist: 0: 167 (28.4%) | 1: 256 (43.5%) | 2: 45 (7.7%) | 3: 120 (20.4%)
+[Train] per-class acc: 0: 44.3% | 1: 65.3% | 2: 12.0% | 3: 65.7%
+2025-10-01 22:58:06,139 | INFO | [Val] acc=23.86% | mean_conf=0.472 | mean_entropy=1.207
+[Val] pred_hist: 0: 27 (30.7%) | 1: 55 (62.5%) | 2: 0 (0.0%) | 3: 6 (6.8%)
+[Val] per-class acc: 0: 53.8% | 1: 72.7% | 2: 0.0% | 3: 18.2%
+2025-10-01 22:58:06,139 | INFO | Validation Loss: 0.9208 | CE: 1.3203 | Focal: 0.5213 | Acc: 23.86% | LR: 1.00e-04
+2025-10-01 23:00:51,748 | INFO | 
+--- Epoch 4 finished: Avg Loss: 1.1578, Avg Acc: 44.90% ---
+2025-10-01 23:00:51,749 | INFO | [Train] acc=44.90% | mean_conf=0.484 | mean_entropy=1.151
+[Train] pred_hist: 0: 214 (36.4%) | 1: 234 (39.8%) | 2: 16 (2.7%) | 3: 124 (21.1%)
+[Train] per-class acc: 0: 51.0% | 1: 56.8% | 2: 3.9% | 3: 71.6%
+2025-10-01 23:01:01,885 | INFO | [Val] acc=56.82% | mean_conf=0.568 | mean_entropy=1.017
+[Val] pred_hist: 0: 45 (51.1%) | 1: 11 (12.5%) | 2: 0 (0.0%) | 3: 32 (36.4%)
+[Val] per-class acc: 0: 100.0% | 1: 54.5% | 2: 0.0% | 3: 93.9%
+2025-10-01 23:01:01,885 | INFO | Validation Loss: 0.6840 | CE: 0.9669 | Focal: 0.4012 | Acc: 56.82% | LR: 1.00e-04
+2025-10-01 23:03:08,418 | INFO | 
+--- Epoch 5 finished: Avg Loss: 1.0081, Avg Acc: 52.38% ---
+2025-10-01 23:03:08,418 | INFO | [Train] acc=52.38% | mean_conf=0.532 | mean_entropy=1.037
+[Train] pred_hist: 0: 279 (47.4%) | 1: 155 (26.4%) | 2: 20 (3.4%) | 3: 134 (22.8%)
+[Train] per-class acc: 0: 66.2% | 1: 55.2% | 2: 5.9% | 3: 92.1%
+2025-10-01 23:03:18,675 | INFO | [Val] acc=61.36% | mean_conf=0.621 | mean_entropy=0.849
+[Val] pred_hist: 0: 37 (42.0%) | 1: 10 (11.4%) | 2: 8 (9.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 54.5% | 2: 16.1% | 3: 97.0%
+2025-10-01 23:03:18,675 | INFO | Validation Loss: 0.6230 | CE: 0.8662 | Focal: 0.3798 | Acc: 61.36% | LR: 1.00e-04
+2025-10-01 23:05:26,781 | INFO | 
+--- Epoch 6 finished: Avg Loss: 0.9254, Avg Acc: 58.50% ---
+2025-10-01 23:05:26,782 | INFO | [Train] acc=58.50% | mean_conf=0.582 | mean_entropy=0.926
+[Train] pred_hist: 0: 183 (31.1%) | 1: 184 (31.3%) | 2: 70 (11.9%) | 3: 151 (25.7%)
+[Train] per-class acc: 0: 52.7% | 1: 66.2% | 2: 25.9% | 3: 88.6%
+2025-10-01 23:05:38,249 | INFO | [Val] acc=60.23% | mean_conf=0.614 | mean_entropy=0.807
+[Val] pred_hist: 0: 31 (35.2%) | 1: 5 (5.7%) | 2: 19 (21.6%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 27.3% | 2: 35.5% | 3: 97.0%
+2025-10-01 23:05:38,249 | INFO | Validation Loss: 0.6064 | CE: 0.8125 | Focal: 0.4004 | Acc: 60.23% | LR: 1.00e-04
+2025-10-01 23:10:18,391 | INFO | 
+--- Epoch 7 finished: Avg Loss: 1.0132, Avg Acc: 51.19% ---
+2025-10-01 23:10:18,392 | INFO | [Train] acc=51.19% | mean_conf=0.551 | mean_entropy=0.962
+[Train] pred_hist: 0: 252 (42.9%) | 1: 178 (30.3%) | 2: 37 (6.3%) | 3: 121 (20.6%)
+[Train] per-class acc: 0: 62.3% | 1: 47.6% | 2: 9.5% | 3: 88.5%
+2025-10-01 23:10:33,776 | INFO | [Val] acc=50.00% | mean_conf=0.708 | mean_entropy=0.702
+[Val] pred_hist: 0: 1 (1.1%) | 1: 54 (61.4%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 0.0% | 1: 100.0% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:10:33,776 | INFO | Validation Loss: 0.6679 | CE: 0.9072 | Focal: 0.4287 | Acc: 50.00% | LR: 1.00e-04
+2025-10-01 23:12:49,370 | INFO | 
+--- Epoch 8 finished: Avg Loss: 0.9015, Avg Acc: 57.48% ---
+2025-10-01 23:12:49,370 | INFO | [Train] acc=57.48% | mean_conf=0.602 | mean_entropy=0.884
+[Train] pred_hist: 0: 249 (42.3%) | 1: 172 (29.3%) | 2: 24 (4.1%) | 3: 143 (24.3%)
+[Train] per-class acc: 0: 65.5% | 1: 63.0% | 2: 7.5% | 3: 93.9%
+2025-10-01 23:12:59,666 | INFO | [Val] acc=53.41% | mean_conf=0.644 | mean_entropy=0.785
+[Val] pred_hist: 0: 54 (61.4%) | 1: 1 (1.1%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 100.0% | 1: 9.1% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:12:59,666 | INFO | Validation Loss: 0.5996 | CE: 0.8061 | Focal: 0.3931 | Acc: 53.41% | LR: 1.00e-04
+2025-10-01 23:15:00,138 | INFO | 
+--- Epoch 9 finished: Avg Loss: 0.8068, Avg Acc: 60.88% ---
+2025-10-01 23:15:00,138 | INFO | [Train] acc=60.88% | mean_conf=0.646 | mean_entropy=0.792
+[Train] pred_hist: 0: 237 (40.3%) | 1: 175 (29.8%) | 2: 12 (2.0%) | 3: 164 (27.9%)
+[Train] per-class acc: 0: 65.7% | 1: 64.2% | 2: 3.8% | 3: 99.4%
+2025-10-01 23:15:10,053 | INFO | [Val] acc=54.55% | mean_conf=0.637 | mean_entropy=0.754
+[Val] pred_hist: 0: 52 (59.1%) | 1: 1 (1.1%) | 2: 1 (1.1%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 100.0% | 1: 9.1% | 2: 3.2% | 3: 100.0%
+2025-10-01 23:15:10,053 | INFO | Validation Loss: 0.6288 | CE: 0.8346 | Focal: 0.4230 | Acc: 54.55% | LR: 1.00e-04
+2025-10-01 23:17:09,084 | INFO | 
+--- Epoch 10 finished: Avg Loss: 0.6745, Avg Acc: 54.76% ---
+2025-10-01 23:17:09,085 | INFO | [Train] acc=54.76% | mean_conf=0.612 | mean_entropy=0.828
+[Train] pred_hist: 0: 235 (40.0%) | 1: 200 (34.0%) | 2: 21 (3.6%) | 3: 132 (22.4%)
+[Train] per-class acc: 0: 58.0% | 1: 64.5% | 2: 6.8% | 3: 98.5%
+2025-10-01 23:17:18,976 | INFO | [Val] acc=51.14% | mean_conf=0.647 | mean_entropy=0.722
+[Val] pred_hist: 0: 52 (59.1%) | 1: 3 (3.4%) | 2: 1 (1.1%) | 3: 32 (36.4%)
+[Val] per-class acc: 0: 92.3% | 1: 9.1% | 2: 0.0% | 3: 97.0%
+2025-10-01 23:17:18,976 | INFO | Validation Loss: 0.6025 | CE: 0.8300 | Focal: 0.3749 | Acc: 51.14% | LR: 1.00e-04
+2025-10-01 23:19:22,131 | INFO | 
+--- Epoch 11 finished: Avg Loss: 0.6332, Avg Acc: 60.71% ---
+2025-10-01 23:19:22,131 | INFO | [Train] acc=60.71% | mean_conf=0.651 | mean_entropy=0.769
+[Train] pred_hist: 0: 268 (45.6%) | 1: 162 (27.6%) | 2: 11 (1.9%) | 3: 147 (25.0%)
+[Train] per-class acc: 0: 72.9% | 1: 63.5% | 2: 3.6% | 3: 98.6%
+2025-10-01 23:19:32,117 | INFO | [Val] acc=50.00% | mean_conf=0.731 | mean_entropy=0.608
+[Val] pred_hist: 0: 0 (0.0%) | 1: 55 (62.5%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 0.0% | 1: 100.0% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:19:32,117 | INFO | Validation Loss: 0.6696 | CE: 0.9118 | Focal: 0.4273 | Acc: 50.00% | LR: 1.00e-04
+2025-10-01 23:21:29,133 | INFO | 
+--- Epoch 12 finished: Avg Loss: 0.6791, Avg Acc: 57.31% ---
+2025-10-01 23:21:29,133 | INFO | [Train] acc=57.31% | mean_conf=0.631 | mean_entropy=0.798
+[Train] pred_hist: 0: 226 (38.4%) | 1: 221 (37.6%) | 2: 6 (1.0%) | 3: 135 (23.0%)
+[Train] per-class acc: 0: 59.0% | 1: 75.0% | 2: 1.4% | 3: 96.4%
+2025-10-01 23:21:39,233 | INFO | [Val] acc=53.41% | mean_conf=0.636 | mean_entropy=0.798
+[Val] pred_hist: 0: 48 (54.5%) | 1: 10 (11.4%) | 2: 0 (0.0%) | 3: 30 (34.1%)
+[Val] per-class acc: 0: 92.3% | 1: 45.5% | 2: 0.0% | 3: 90.9%
+2025-10-01 23:21:39,233 | INFO | Validation Loss: 0.6500 | CE: 0.9030 | Focal: 0.3970 | Acc: 53.41% | LR: 1.00e-04
+2025-10-01 23:23:32,018 | INFO | 
+--- Epoch 13 finished: Avg Loss: 0.6249, Avg Acc: 60.88% ---
+2025-10-01 23:23:32,018 | INFO | [Train] acc=60.88% | mean_conf=0.640 | mean_entropy=0.802
+[Train] pred_hist: 0: 257 (43.7%) | 1: 194 (33.0%) | 2: 5 (0.9%) | 3: 132 (22.4%)
+[Train] per-class acc: 0: 69.6% | 1: 76.5% | 2: 1.4% | 3: 94.2%
+2025-10-01 23:23:42,085 | INFO | [Val] acc=54.55% | mean_conf=0.697 | mean_entropy=0.673
+[Val] pred_hist: 0: 51 (58.0%) | 1: 4 (4.5%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 27.3% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:23:42,085 | INFO | Validation Loss: 0.5646 | CE: 0.7615 | Focal: 0.3676 | Acc: 54.55% | LR: 1.00e-04
+2025-10-01 23:25:39,234 | INFO | 
+--- Epoch 14 finished: Avg Loss: 0.5950, Avg Acc: 64.12% ---
+2025-10-01 23:25:39,235 | INFO | [Train] acc=64.12% | mean_conf=0.667 | mean_entropy=0.747
+[Train] pred_hist: 0: 306 (52.0%) | 1: 126 (21.4%) | 2: 4 (0.7%) | 3: 152 (25.9%)
+[Train] per-class acc: 0: 84.6% | 1: 66.0% | 2: 0.7% | 3: 98.7%
+2025-10-01 23:25:48,960 | INFO | [Val] acc=57.95% | mean_conf=0.718 | mean_entropy=0.630
+[Val] pred_hist: 0: 36 (40.9%) | 1: 19 (21.6%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 81.8% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:25:48,960 | INFO | Validation Loss: 0.5601 | CE: 0.7784 | Focal: 0.3417 | Acc: 57.95% | LR: 1.00e-04
+2025-10-01 23:27:46,077 | INFO | 
+--- Epoch 15 finished: Avg Loss: 0.5604, Avg Acc: 65.14% ---
+2025-10-01 23:27:46,078 | INFO | [Train] acc=65.14% | mean_conf=0.671 | mean_entropy=0.741
+[Train] pred_hist: 0: 308 (52.4%) | 1: 142 (24.1%) | 2: 7 (1.2%) | 3: 131 (22.3%)
+[Train] per-class acc: 0: 83.9% | 1: 71.8% | 2: 2.9% | 3: 99.2%
+2025-10-01 23:27:57,113 | INFO | [Val] acc=59.09% | mean_conf=0.741 | mean_entropy=0.605
+[Val] pred_hist: 0: 44 (50.0%) | 1: 10 (11.4%) | 2: 0 (0.0%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 92.3% | 1: 63.6% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:27:57,113 | INFO | Validation Loss: 0.5622 | CE: 0.7745 | Focal: 0.3498 | Acc: 59.09% | LR: 1.00e-04
+2025-10-01 23:30:11,355 | INFO | 
+--- Epoch 16 finished: Avg Loss: 0.5669, Avg Acc: 64.46% ---
+2025-10-01 23:30:11,356 | INFO | [Train] acc=64.46% | mean_conf=0.693 | mean_entropy=0.708
+[Train] pred_hist: 0: 313 (53.2%) | 1: 136 (23.1%) | 2: 2 (0.3%) | 3: 137 (23.3%)
+[Train] per-class acc: 0: 87.4% | 1: 68.7% | 2: 0.7% | 3: 97.1%
+2025-10-01 23:30:21,740 | INFO | [Val] acc=48.86% | mean_conf=0.646 | mean_entropy=0.788
+[Val] pred_hist: 0: 53 (60.2%) | 1: 9 (10.2%) | 2: 0 (0.0%) | 3: 26 (29.5%)
+[Val] per-class acc: 0: 84.6% | 1: 54.5% | 2: 0.0% | 3: 78.8%
+2025-10-01 23:30:21,740 | INFO | Validation Loss: 0.6974 | CE: 0.9770 | Focal: 0.4178 | Acc: 48.86% | LR: 1.00e-04
+2025-10-01 23:32:30,781 | INFO | 
+--- Epoch 17 finished: Avg Loss: 0.5631, Avg Acc: 65.14% ---
+2025-10-01 23:32:30,782 | INFO | [Train] acc=65.14% | mean_conf=0.689 | mean_entropy=0.708
+[Train] pred_hist: 0: 280 (47.6%) | 1: 152 (25.9%) | 2: 8 (1.4%) | 3: 148 (25.2%)
+[Train] per-class acc: 0: 83.9% | 1: 76.0% | 2: 2.1% | 3: 96.7%
+2025-10-01 23:32:42,542 | INFO | [Val] acc=57.95% | mean_conf=0.706 | mean_entropy=0.658
+[Val] pred_hist: 0: 46 (52.3%) | 1: 9 (10.2%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 54.5% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:32:42,542 | INFO | Validation Loss: 0.5196 | CE: 0.7213 | Focal: 0.3178 | Acc: 57.95% | LR: 1.00e-04
+2025-10-01 23:34:47,721 | INFO | 
+--- Epoch 18 finished: Avg Loss: 0.5306, Avg Acc: 66.33% ---
+2025-10-01 23:34:47,721 | INFO | [Train] acc=66.33% | mean_conf=0.687 | mean_entropy=0.714
+[Train] pred_hist: 0: 310 (52.7%) | 1: 141 (24.0%) | 2: 7 (1.2%) | 3: 130 (22.1%)
+[Train] per-class acc: 0: 92.2% | 1: 77.3% | 2: 2.6% | 3: 98.5%
+2025-10-01 23:34:59,543 | INFO | [Val] acc=52.27% | mean_conf=0.712 | mean_entropy=0.644
+[Val] pred_hist: 0: 49 (55.7%) | 1: 5 (5.7%) | 2: 0 (0.0%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 84.6% | 1: 18.2% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:34:59,543 | INFO | Validation Loss: 0.5933 | CE: 0.7807 | Focal: 0.4059 | Acc: 52.27% | LR: 1.00e-04
+2025-10-01 23:37:05,660 | INFO | 
+--- Epoch 19 finished: Avg Loss: 0.5537, Avg Acc: 68.54% ---
+2025-10-01 23:37:05,661 | INFO | [Train] acc=68.54% | mean_conf=0.707 | mean_entropy=0.678
+[Train] pred_hist: 0: 284 (48.3%) | 1: 152 (25.9%) | 2: 5 (0.9%) | 3: 147 (25.0%)
+[Train] per-class acc: 0: 84.7% | 1: 74.2% | 2: 0.8% | 3: 98.0%
+2025-10-01 23:37:15,876 | INFO | [Val] acc=54.55% | mean_conf=0.702 | mean_entropy=0.658
+[Val] pred_hist: 0: 53 (60.2%) | 1: 2 (2.3%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 100.0% | 1: 18.2% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:37:15,876 | INFO | Validation Loss: 0.5751 | CE: 0.7689 | Focal: 0.3813 | Acc: 54.55% | LR: 1.00e-04
+2025-10-01 23:39:21,459 | INFO | 
+--- Epoch 20 finished: Avg Loss: 0.5049, Avg Acc: 67.52% ---
+2025-10-01 23:39:21,459 | INFO | [Train] acc=67.52% | mean_conf=0.719 | mean_entropy=0.648
+[Train] pred_hist: 0: 267 (45.4%) | 1: 158 (26.9%) | 2: 5 (0.9%) | 3: 158 (26.9%)
+[Train] per-class acc: 0: 85.2% | 1: 78.3% | 2: 0.7% | 3: 99.4%
+2025-10-01 23:39:32,434 | INFO | [Val] acc=12.50% | mean_conf=0.868 | mean_entropy=0.436
+[Val] pred_hist: 0: 1 (1.1%) | 1: 87 (98.9%) | 2: 0 (0.0%) | 3: 0 (0.0%)
+[Val] per-class acc: 0: 0.0% | 1: 100.0% | 2: 0.0% | 3: 0.0%
+2025-10-01 23:39:32,434 | INFO | Validation Loss: 2.1453 | CE: 2.6653 | Focal: 1.6253 | Acc: 12.50% | LR: 1.00e-04
+2025-10-01 23:41:47,369 | INFO | 
+--- Epoch 21 finished: Avg Loss: 0.5481, Avg Acc: 63.44% ---
+2025-10-01 23:41:47,369 | INFO | [Train] acc=63.44% | mean_conf=0.696 | mean_entropy=0.707
+[Train] pred_hist: 0: 282 (48.0%) | 1: 157 (26.7%) | 2: 6 (1.0%) | 3: 143 (24.3%)
+[Train] per-class acc: 0: 84.5% | 1: 76.1% | 2: 1.9% | 3: 97.3%
+2025-10-01 23:41:57,278 | INFO | [Val] acc=61.36% | mean_conf=0.710 | mean_entropy=0.648
+[Val] pred_hist: 0: 36 (40.9%) | 1: 19 (21.6%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 90.9% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:41:57,279 | INFO | Validation Loss: 0.4881 | CE: 0.7015 | Focal: 0.2747 | Acc: 61.36% | LR: 1.00e-04
+2025-10-01 23:44:07,463 | INFO | 
+--- Epoch 22 finished: Avg Loss: 0.4802, Avg Acc: 68.03% ---
+2025-10-01 23:44:07,464 | INFO | [Train] acc=68.03% | mean_conf=0.699 | mean_entropy=0.677
+[Train] pred_hist: 0: 273 (46.4%) | 1: 152 (25.9%) | 2: 11 (1.9%) | 3: 152 (25.9%)
+[Train] per-class acc: 0: 86.2% | 1: 77.9% | 2: 5.6% | 3: 100.0%
+2025-10-01 23:44:17,331 | INFO | [Val] acc=59.09% | mean_conf=0.762 | mean_entropy=0.562
+[Val] pred_hist: 0: 43 (48.9%) | 1: 12 (13.6%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 72.7% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:44:17,331 | INFO | Validation Loss: 0.5081 | CE: 0.6985 | Focal: 0.3177 | Acc: 59.09% | LR: 1.00e-04
+2025-10-01 23:46:21,312 | INFO | 
+--- Epoch 23 finished: Avg Loss: 0.5101, Avg Acc: 64.97% ---
+2025-10-01 23:46:21,312 | INFO | [Train] acc=64.97% | mean_conf=0.712 | mean_entropy=0.647
+[Train] pred_hist: 0: 306 (52.0%) | 1: 133 (22.6%) | 2: 9 (1.5%) | 3: 140 (23.8%)
+[Train] per-class acc: 0: 87.9% | 1: 77.3% | 2: 1.3% | 3: 100.0%
+2025-10-01 23:46:31,376 | INFO | [Val] acc=60.23% | mean_conf=0.729 | mean_entropy=0.603
+[Val] pred_hist: 0: 43 (48.9%) | 1: 12 (13.6%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 72.7% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:46:31,376 | INFO | Validation Loss: 0.4910 | CE: 0.6896 | Focal: 0.2924 | Acc: 60.23% | LR: 1.00e-04
+2025-10-01 23:48:50,664 | INFO | 
+--- Epoch 24 finished: Avg Loss: 0.5511, Avg Acc: 62.24% ---
+2025-10-01 23:48:50,665 | INFO | [Train] acc=62.24% | mean_conf=0.690 | mean_entropy=0.689
+[Train] pred_hist: 0: 305 (51.9%) | 1: 143 (24.3%) | 2: 9 (1.5%) | 3: 131 (22.3%)
+[Train] per-class acc: 0: 83.6% | 1: 75.2% | 2: 3.0% | 3: 100.0%
+2025-10-01 23:49:01,222 | INFO | [Val] acc=57.95% | mean_conf=0.709 | mean_entropy=0.600
+[Val] pred_hist: 0: 45 (51.1%) | 1: 9 (10.2%) | 2: 0 (0.0%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 92.3% | 1: 54.5% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:49:01,222 | INFO | Validation Loss: 0.4925 | CE: 0.6849 | Focal: 0.3002 | Acc: 57.95% | LR: 1.00e-04
+2025-10-01 23:52:20,433 | INFO | 
+--- Epoch 25 finished: Avg Loss: 0.4514, Avg Acc: 69.05% ---
+2025-10-01 23:52:20,434 | INFO | [Train] acc=69.05% | mean_conf=0.731 | mean_entropy=0.617
+[Train] pred_hist: 0: 257 (43.7%) | 1: 168 (28.6%) | 2: 9 (1.5%) | 3: 154 (26.2%)
+[Train] per-class acc: 0: 83.2% | 1: 83.6% | 2: 3.6% | 3: 99.4%
+2025-10-01 23:52:30,586 | INFO | [Val] acc=61.36% | mean_conf=0.754 | mean_entropy=0.549
+[Val] pred_hist: 0: 37 (42.0%) | 1: 17 (19.3%) | 2: 1 (1.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 81.8% | 2: 3.2% | 3: 100.0%
+2025-10-01 23:52:30,586 | INFO | Validation Loss: 0.5267 | CE: 0.7062 | Focal: 0.3471 | Acc: 61.36% | LR: 1.00e-04
+2025-10-01 23:57:04,871 | INFO | 
+--- Epoch 26 finished: Avg Loss: 0.4771, Avg Acc: 68.71% ---
+2025-10-01 23:57:04,871 | INFO | [Train] acc=68.71% | mean_conf=0.718 | mean_entropy=0.638
+[Train] pred_hist: 0: 264 (44.9%) | 1: 140 (23.8%) | 2: 26 (4.4%) | 3: 158 (26.9%)
+[Train] per-class acc: 0: 81.2% | 1: 82.7% | 2: 9.7% | 3: 98.7%
+2025-10-01 23:57:15,382 | INFO | [Val] acc=61.36% | mean_conf=0.695 | mean_entropy=0.640
+[Val] pred_hist: 0: 28 (31.8%) | 1: 2 (2.3%) | 2: 22 (25.0%) | 3: 36 (40.9%)
+[Val] per-class acc: 0: 53.8% | 1: 9.1% | 2: 41.9% | 3: 100.0%
+2025-10-01 23:57:15,383 | INFO | Validation Loss: 0.6639 | CE: 0.8276 | Focal: 0.5002 | Acc: 61.36% | LR: 1.00e-04
+2025-10-01 23:59:38,781 | INFO | 
+--- Epoch 27 finished: Avg Loss: 0.4613, Avg Acc: 68.20% ---
+2025-10-01 23:59:38,781 | INFO | [Train] acc=68.20% | mean_conf=0.721 | mean_entropy=0.621
+[Train] pred_hist: 0: 274 (46.6%) | 1: 148 (25.2%) | 2: 31 (5.3%) | 3: 135 (23.0%)
+[Train] per-class acc: 0: 84.7% | 1: 83.4% | 2: 11.5% | 3: 99.3%
+2025-10-01 23:59:52,370 | INFO | [Val] acc=55.68% | mean_conf=0.708 | mean_entropy=0.612
+[Val] pred_hist: 0: 48 (54.5%) | 1: 6 (6.8%) | 2: 1 (1.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 100.0% | 1: 27.3% | 2: 0.0% | 3: 100.0%
+2025-10-01 23:59:52,370 | INFO | Validation Loss: 0.5167 | CE: 0.6996 | Focal: 0.3338 | Acc: 55.68% | LR: 1.00e-04
+2025-10-02 00:02:09,015 | INFO | 
+--- Epoch 28 finished: Avg Loss: 0.4625, Avg Acc: 66.50% ---
+2025-10-02 00:02:09,015 | INFO | [Train] acc=66.50% | mean_conf=0.723 | mean_entropy=0.635
+[Train] pred_hist: 0: 277 (47.1%) | 1: 163 (27.7%) | 2: 17 (2.9%) | 3: 131 (22.3%)
+[Train] per-class acc: 0: 80.9% | 1: 84.1% | 2: 4.0% | 3: 100.0%
+2025-10-02 00:02:19,661 | INFO | [Val] acc=57.95% | mean_conf=0.755 | mean_entropy=0.553
+[Val] pred_hist: 0: 45 (51.1%) | 1: 10 (11.4%) | 2: 0 (0.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 54.5% | 2: 0.0% | 3: 100.0%
+2025-10-02 00:02:19,661 | INFO | Validation Loss: 0.5018 | CE: 0.6887 | Focal: 0.3148 | Acc: 57.95% | LR: 1.00e-04
+2025-10-02 00:04:32,007 | INFO | 
+--- Epoch 29 finished: Avg Loss: 0.4335, Avg Acc: 69.22% ---
+2025-10-02 00:04:32,008 | INFO | [Train] acc=69.22% | mean_conf=0.752 | mean_entropy=0.574
+[Train] pred_hist: 0: 257 (43.7%) | 1: 156 (26.5%) | 2: 15 (2.6%) | 3: 160 (27.2%)
+[Train] per-class acc: 0: 85.6% | 1: 86.5% | 2: 4.7% | 3: 99.4%
+2025-10-02 00:04:44,563 | INFO | [Val] acc=54.55% | mean_conf=0.763 | mean_entropy=0.575
+[Val] pred_hist: 0: 28 (31.8%) | 1: 30 (34.1%) | 2: 4 (4.5%) | 3: 26 (29.5%)
+[Val] per-class acc: 0: 61.5% | 1: 90.9% | 2: 12.9% | 3: 78.8%
+2025-10-02 00:04:44,563 | INFO | Validation Loss: 0.7529 | CE: 0.9895 | Focal: 0.5164 | Acc: 54.55% | LR: 1.00e-04
+2025-10-02 00:06:58,728 | INFO | 
+--- Epoch 30 finished: Avg Loss: 0.4982, Avg Acc: 68.20% ---
+2025-10-02 00:06:58,728 | INFO | [Train] acc=68.20% | mean_conf=0.714 | mean_entropy=0.642
+[Train] pred_hist: 0: 224 (38.1%) | 1: 187 (31.8%) | 2: 29 (4.9%) | 3: 148 (25.2%)
+[Train] per-class acc: 0: 81.2% | 1: 83.0% | 2: 9.6% | 3: 98.0%
+2025-10-02 00:07:08,850 | INFO | [Val] acc=60.23% | mean_conf=0.727 | mean_entropy=0.591
+[Val] pred_hist: 0: 33 (37.5%) | 1: 19 (21.6%) | 2: 2 (2.3%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 76.9% | 1: 81.8% | 2: 3.2% | 3: 100.0%
+2025-10-02 00:07:08,850 | INFO | Validation Loss: 0.5245 | CE: 0.7197 | Focal: 0.3292 | Acc: 60.23% | LR: 1.00e-04
+2025-10-02 00:09:14,680 | INFO | 
+--- Epoch 31 finished: Avg Loss: 0.4058, Avg Acc: 72.62% ---
+2025-10-02 00:09:14,681 | INFO | [Train] acc=72.62% | mean_conf=0.752 | mean_entropy=0.579
+[Train] pred_hist: 0: 256 (43.5%) | 1: 166 (28.2%) | 2: 7 (1.2%) | 3: 159 (27.0%)
+[Train] per-class acc: 0: 89.1% | 1: 89.8% | 2: 3.7% | 3: 100.0%
+2025-10-02 00:09:25,453 | INFO | [Val] acc=64.77% | mean_conf=0.710 | mean_entropy=0.585
+[Val] pred_hist: 0: 35 (39.8%) | 1: 4 (4.5%) | 2: 16 (18.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 27.3% | 2: 32.3% | 3: 100.0%
+2025-10-02 00:09:25,453 | INFO | Validation Loss: 0.6022 | CE: 0.7663 | Focal: 0.4380 | Acc: 64.77% | LR: 1.00e-04
+2025-10-02 00:11:51,551 | INFO | 
+--- Epoch 32 finished: Avg Loss: 0.4303, Avg Acc: 71.26% ---
+2025-10-02 00:11:51,551 | INFO | [Train] acc=71.26% | mean_conf=0.740 | mean_entropy=0.601
+[Train] pred_hist: 0: 269 (45.7%) | 1: 160 (27.2%) | 2: 22 (3.7%) | 3: 137 (23.3%)
+[Train] per-class acc: 0: 93.3% | 1: 87.5% | 2: 10.8% | 3: 99.3%
+2025-10-02 00:12:01,607 | INFO | [Val] acc=67.05% | mean_conf=0.695 | mean_entropy=0.604
+[Val] pred_hist: 0: 25 (28.4%) | 1: 10 (11.4%) | 2: 20 (22.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 45.5% | 2: 45.2% | 3: 100.0%
+2025-10-02 00:12:01,607 | INFO | Validation Loss: 0.5072 | CE: 0.6678 | Focal: 0.3467 | Acc: 67.05% | LR: 1.00e-04
+2025-10-02 00:12:01,621 | INFO | \u2705 New best model saved: Medium_v3.3_67.05.pth
+2025-10-02 00:14:16,926 | INFO | 
+--- Epoch 33 finished: Avg Loss: 0.3745, Avg Acc: 71.43% ---
+2025-10-02 00:14:16,926 | INFO | [Train] acc=71.43% | mean_conf=0.741 | mean_entropy=0.570
+[Train] pred_hist: 0: 250 (42.5%) | 1: 140 (23.8%) | 2: 50 (8.5%) | 3: 148 (25.2%)
+[Train] per-class acc: 0: 83.3% | 1: 91.4% | 2: 18.6% | 3: 99.3%
+2025-10-02 00:14:27,452 | INFO | [Val] acc=70.45% | mean_conf=0.707 | mean_entropy=0.580
+[Val] pred_hist: 0: 16 (18.2%) | 1: 7 (8.0%) | 2: 30 (34.1%) | 3: 35 (39.8%)
+[Val] per-class acc: 0: 38.5% | 1: 45.5% | 2: 61.3% | 3: 100.0%
+2025-10-02 00:14:27,452 | INFO | Validation Loss: 0.5372 | CE: 0.6967 | Focal: 0.3777 | Acc: 70.45% | LR: 1.00e-04
+2025-10-02 00:14:27,461 | INFO | \u2705 New best model saved: Medium_v3.3_70.45.pth
+2025-10-02 00:16:43,362 | INFO | 
+--- Epoch 34 finished: Avg Loss: 0.4419, Avg Acc: 71.94% ---
+2025-10-02 00:16:43,363 | INFO | [Train] acc=71.94% | mean_conf=0.736 | mean_entropy=0.595
+[Train] pred_hist: 0: 215 (36.6%) | 1: 167 (28.4%) | 2: 75 (12.8%) | 3: 131 (22.3%)
+[Train] per-class acc: 0: 77.9% | 1: 85.9% | 2: 32.9% | 3: 97.7%
+2025-10-02 00:16:53,848 | INFO | [Val] acc=60.23% | mean_conf=0.743 | mean_entropy=0.582
+[Val] pred_hist: 0: 22 (25.0%) | 1: 31 (35.2%) | 2: 2 (2.3%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 100.0% | 2: 6.5% | 3: 100.0%
+2025-10-02 00:16:53,848 | INFO | Validation Loss: 0.4868 | CE: 0.6829 | Focal: 0.2907 | Acc: 60.23% | LR: 1.00e-04
+2025-10-02 00:19:03,261 | INFO | 
+--- Epoch 35 finished: Avg Loss: 0.3957, Avg Acc: 72.45% ---
+2025-10-02 00:19:03,262 | INFO | [Train] acc=72.45% | mean_conf=0.740 | mean_entropy=0.584
+[Train] pred_hist: 0: 247 (42.0%) | 1: 153 (26.0%) | 2: 44 (7.5%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 85.5% | 1: 90.9% | 2: 20.1% | 3: 99.3%
+2025-10-02 00:19:14,251 | INFO | [Val] acc=69.32% | mean_conf=0.712 | mean_entropy=0.572
+[Val] pred_hist: 0: 16 (18.2%) | 1: 9 (10.2%) | 2: 30 (34.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 38.5% | 1: 36.4% | 2: 61.3% | 3: 100.0%
+2025-10-02 00:19:14,251 | INFO | Validation Loss: 0.5265 | CE: 0.6900 | Focal: 0.3630 | Acc: 69.32% | LR: 1.00e-04
+2025-10-02 00:21:25,228 | INFO | 
+--- Epoch 36 finished: Avg Loss: 0.4329, Avg Acc: 72.11% ---
+2025-10-02 00:21:25,228 | INFO | [Train] acc=72.11% | mean_conf=0.733 | mean_entropy=0.594
+[Train] pred_hist: 0: 239 (40.6%) | 1: 172 (29.3%) | 2: 52 (8.8%) | 3: 125 (21.3%)
+[Train] per-class acc: 0: 83.6% | 1: 86.9% | 2: 23.8% | 3: 97.6%
+2025-10-02 00:21:35,306 | INFO | [Val] acc=51.14% | mean_conf=0.695 | mean_entropy=0.662
+[Val] pred_hist: 0: 30 (34.1%) | 1: 31 (35.2%) | 2: 3 (3.4%) | 3: 24 (27.3%)
+[Val] per-class acc: 0: 76.9% | 1: 81.8% | 2: 6.5% | 3: 72.7%
+2025-10-02 00:21:35,306 | INFO | Validation Loss: 0.7400 | CE: 0.9992 | Focal: 0.4808 | Acc: 51.14% | LR: 1.00e-04
+2025-10-02 00:23:43,786 | INFO | 
+--- Epoch 37 finished: Avg Loss: 0.4096, Avg Acc: 70.58% ---
+2025-10-02 00:23:43,787 | INFO | [Train] acc=70.58% | mean_conf=0.745 | mean_entropy=0.570
+[Train] pred_hist: 0: 247 (42.0%) | 1: 168 (28.6%) | 2: 27 (4.6%) | 3: 146 (24.8%)
+[Train] per-class acc: 0: 86.2% | 1: 90.9% | 2: 9.3% | 3: 98.0%
+2025-10-02 00:23:53,678 | INFO | [Val] acc=61.36% | mean_conf=0.744 | mean_entropy=0.543
+[Val] pred_hist: 0: 37 (42.0%) | 1: 10 (11.4%) | 2: 7 (8.0%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 84.6% | 1: 45.5% | 2: 16.1% | 3: 100.0%
+2025-10-02 00:23:53,678 | INFO | Validation Loss: 0.6152 | CE: 0.7876 | Focal: 0.4427 | Acc: 61.36% | LR: 1.00e-04
+2025-10-02 00:26:08,600 | INFO | 
+--- Epoch 38 finished: Avg Loss: 0.3395, Avg Acc: 75.68% ---
+2025-10-02 00:26:08,602 | INFO | [Train] acc=75.68% | mean_conf=0.777 | mean_entropy=0.510
+[Train] pred_hist: 0: 230 (39.1%) | 1: 166 (28.2%) | 2: 31 (5.3%) | 3: 161 (27.4%)
+[Train] per-class acc: 0: 92.4% | 1: 90.9% | 2: 14.5% | 3: 99.4%
+2025-10-02 00:26:19,403 | INFO | [Val] acc=60.23% | mean_conf=0.733 | mean_entropy=0.556
+[Val] pred_hist: 0: 43 (48.9%) | 1: 4 (4.5%) | 2: 7 (8.0%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 100.0% | 1: 18.2% | 2: 16.1% | 3: 100.0%
+2025-10-02 00:26:19,403 | INFO | Validation Loss: 0.6575 | CE: 0.8385 | Focal: 0.4765 | Acc: 60.23% | LR: 1.00e-04
+2025-10-02 00:28:31,371 | INFO | 
+--- Epoch 39 finished: Avg Loss: 0.3867, Avg Acc: 75.68% ---
+2025-10-02 00:28:31,371 | INFO | [Train] acc=75.68% | mean_conf=0.772 | mean_entropy=0.523
+[Train] pred_hist: 0: 228 (38.8%) | 1: 168 (28.6%) | 2: 46 (7.8%) | 3: 146 (24.8%)
+[Train] per-class acc: 0: 88.7% | 1: 90.9% | 2: 24.0% | 3: 98.6%
+2025-10-02 00:28:41,462 | INFO | [Val] acc=55.68% | mean_conf=0.736 | mean_entropy=0.627
+[Val] pred_hist: 0: 10 (11.4%) | 1: 26 (29.5%) | 2: 8 (9.1%) | 3: 44 (50.0%)
+[Val] per-class acc: 0: 30.8% | 1: 81.8% | 2: 19.4% | 3: 90.9%
+2025-10-02 00:28:41,462 | INFO | Validation Loss: 0.7648 | CE: 0.9703 | Focal: 0.5593 | Acc: 55.68% | LR: 1.00e-04
+2025-10-02 00:30:43,166 | INFO | 
+--- Epoch 40 finished: Avg Loss: 0.4545, Avg Acc: 70.92% ---
+2025-10-02 00:30:43,166 | INFO | [Train] acc=70.92% | mean_conf=0.740 | mean_entropy=0.594
+[Train] pred_hist: 0: 258 (43.9%) | 1: 155 (26.4%) | 2: 15 (2.6%) | 3: 160 (27.2%)
+[Train] per-class acc: 0: 87.2% | 1: 85.0% | 2: 8.0% | 3: 96.9%
+2025-10-02 00:30:53,329 | INFO | [Val] acc=64.77% | mean_conf=0.692 | mean_entropy=0.619
+[Val] pred_hist: 0: 35 (39.8%) | 1: 10 (11.4%) | 2: 11 (12.5%) | 3: 32 (36.4%)
+[Val] per-class acc: 0: 84.6% | 1: 45.5% | 2: 29.0% | 3: 97.0%
+2025-10-02 00:30:53,329 | INFO | Validation Loss: 0.5180 | CE: 0.6984 | Focal: 0.3376 | Acc: 64.77% | LR: 1.00e-04
+2025-10-02 00:33:06,100 | INFO | 
+--- Epoch 41 finished: Avg Loss: 0.3952, Avg Acc: 74.49% ---
+2025-10-02 00:33:06,100 | INFO | [Train] acc=74.49% | mean_conf=0.760 | mean_entropy=0.547
+[Train] pred_hist: 0: 261 (44.4%) | 1: 141 (24.0%) | 2: 30 (5.1%) | 3: 156 (26.5%)
+[Train] per-class acc: 0: 91.2% | 1: 86.3% | 2: 17.0% | 3: 99.4%
+2025-10-02 00:33:20,544 | INFO | [Val] acc=75.00% | mean_conf=0.752 | mean_entropy=0.542
+[Val] pred_hist: 0: 17 (19.3%) | 1: 16 (18.2%) | 2: 22 (25.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 72.7% | 2: 54.8% | 3: 100.0%
+2025-10-02 00:33:20,544 | INFO | Validation Loss: 0.4622 | CE: 0.6368 | Focal: 0.2877 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 00:33:20,552 | INFO | \u2705 New best model saved: Medium_v3.3_75.00.pth
+2025-10-02 00:35:30,959 | INFO | 
+--- Epoch 42 finished: Avg Loss: 0.3421, Avg Acc: 76.87% ---
+2025-10-02 00:35:30,960 | INFO | [Train] acc=76.87% | mean_conf=0.790 | mean_entropy=0.504
+[Train] pred_hist: 0: 227 (38.6%) | 1: 175 (29.8%) | 2: 35 (6.0%) | 3: 151 (25.7%)
+[Train] per-class acc: 0: 93.7% | 1: 89.9% | 2: 19.0% | 3: 100.0%
+2025-10-02 00:35:45,040 | INFO | [Val] acc=72.73% | mean_conf=0.735 | mean_entropy=0.570
+[Val] pred_hist: 0: 24 (27.3%) | 1: 13 (14.8%) | 2: 18 (20.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 63.6% | 2: 45.2% | 3: 100.0%
+2025-10-02 00:35:45,040 | INFO | Validation Loss: 0.4627 | CE: 0.6303 | Focal: 0.2952 | Acc: 72.73% | LR: 1.00e-04
+2025-10-02 00:37:54,698 | INFO | 
+--- Epoch 43 finished: Avg Loss: 0.3946, Avg Acc: 71.09% ---
+2025-10-02 00:37:54,699 | INFO | [Train] acc=71.09% | mean_conf=0.751 | mean_entropy=0.558
+[Train] pred_hist: 0: 231 (39.3%) | 1: 151 (25.7%) | 2: 52 (8.8%) | 3: 154 (26.2%)
+[Train] per-class acc: 0: 81.9% | 1: 84.4% | 2: 18.8% | 3: 99.4%
+2025-10-02 00:38:07,600 | INFO | [Val] acc=60.23% | mean_conf=0.784 | mean_entropy=0.495
+[Val] pred_hist: 0: 33 (37.5%) | 1: 18 (20.5%) | 2: 4 (4.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 72.7% | 2: 6.5% | 3: 100.0%
+2025-10-02 00:38:07,600 | INFO | Validation Loss: 0.5387 | CE: 0.7146 | Focal: 0.3629 | Acc: 60.23% | LR: 1.00e-04
+2025-10-02 00:42:33,609 | INFO | 
+--- Epoch 44 finished: Avg Loss: 0.3080, Avg Acc: 79.93% ---
+2025-10-02 00:42:33,610 | INFO | [Train] acc=79.93% | mean_conf=0.781 | mean_entropy=0.496
+[Train] pred_hist: 0: 194 (33.0%) | 1: 171 (29.1%) | 2: 66 (11.2%) | 3: 157 (26.7%)
+[Train] per-class acc: 0: 88.2% | 1: 92.8% | 2: 36.4% | 3: 100.0%
+2025-10-02 00:42:47,573 | INFO | [Val] acc=71.59% | mean_conf=0.778 | mean_entropy=0.504
+[Val] pred_hist: 0: 28 (31.8%) | 1: 11 (12.5%) | 2: 16 (18.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 54.5% | 2: 45.2% | 3: 100.0%
+2025-10-02 00:42:47,573 | INFO | Validation Loss: 0.5399 | CE: 0.7032 | Focal: 0.3767 | Acc: 71.59% | LR: 1.00e-04
+2025-10-02 00:44:47,203 | INFO | 
+--- Epoch 45 finished: Avg Loss: 0.3331, Avg Acc: 78.40% ---
+2025-10-02 00:44:47,204 | INFO | [Train] acc=78.40% | mean_conf=0.799 | mean_entropy=0.489
+[Train] pred_hist: 0: 247 (42.0%) | 1: 157 (26.7%) | 2: 46 (7.8%) | 3: 138 (23.5%)
+[Train] per-class acc: 0: 94.0% | 1: 92.3% | 2: 25.5% | 3: 99.3%
+2025-10-02 00:45:01,438 | INFO | [Val] acc=76.14% | mean_conf=0.729 | mean_entropy=0.583
+[Val] pred_hist: 0: 4 (4.5%) | 1: 11 (12.5%) | 2: 39 (44.3%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 15.4% | 1: 54.5% | 2: 83.9% | 3: 100.0%
+2025-10-02 00:45:01,438 | INFO | Validation Loss: 0.6097 | CE: 0.7504 | Focal: 0.4691 | Acc: 76.14% | LR: 1.00e-04
+2025-10-02 00:45:01,455 | INFO | \u2705 New best model saved: Medium_v3.3_76.14.pth
+2025-10-02 00:47:07,620 | INFO | 
+--- Epoch 46 finished: Avg Loss: 0.3824, Avg Acc: 74.32% ---
+2025-10-02 00:47:07,621 | INFO | [Train] acc=74.32% | mean_conf=0.770 | mean_entropy=0.519
+[Train] pred_hist: 0: 202 (34.4%) | 1: 165 (28.1%) | 2: 69 (11.7%) | 3: 152 (25.9%)
+[Train] per-class acc: 0: 80.7% | 1: 86.4% | 2: 28.8% | 3: 97.4%
+2025-10-02 00:47:21,958 | INFO | [Val] acc=50.00% | mean_conf=0.767 | mean_entropy=0.532
+[Val] pred_hist: 0: 27 (30.7%) | 1: 37 (42.0%) | 2: 1 (1.1%) | 3: 23 (26.1%)
+[Val] per-class acc: 0: 76.9% | 1: 90.9% | 2: 3.2% | 3: 69.7%
+2025-10-02 00:47:21,958 | INFO | Validation Loss: 0.7433 | CE: 0.9885 | Focal: 0.4981 | Acc: 50.00% | LR: 1.00e-04
+2025-10-02 00:49:17,832 | INFO | 
+--- Epoch 47 finished: Avg Loss: 0.3001, Avg Acc: 76.87% ---
+2025-10-02 00:49:17,833 | INFO | [Train] acc=76.87% | mean_conf=0.791 | mean_entropy=0.476
+[Train] pred_hist: 0: 215 (36.6%) | 1: 157 (26.7%) | 2: 50 (8.5%) | 3: 166 (28.2%)
+[Train] per-class acc: 0: 83.6% | 1: 96.3% | 2: 24.6% | 3: 100.0%
+2025-10-02 00:49:31,876 | INFO | [Val] acc=69.32% | mean_conf=0.796 | mean_entropy=0.463
+[Val] pred_hist: 0: 24 (27.3%) | 1: 17 (19.3%) | 2: 14 (15.9%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 72.7% | 2: 35.5% | 3: 100.0%
+2025-10-02 00:49:31,876 | INFO | Validation Loss: 0.5234 | CE: 0.6788 | Focal: 0.3679 | Acc: 69.32% | LR: 1.00e-04
+2025-10-02 00:51:39,237 | INFO | 
+--- Epoch 48 finished: Avg Loss: 0.3220, Avg Acc: 78.40% ---
+2025-10-02 00:51:39,238 | INFO | [Train] acc=78.40% | mean_conf=0.794 | mean_entropy=0.473
+[Train] pred_hist: 0: 212 (36.1%) | 1: 171 (29.1%) | 2: 61 (10.4%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 91.3% | 1: 92.8% | 2: 32.0% | 3: 100.0%
+2025-10-02 00:51:53,576 | INFO | [Val] acc=77.27% | mean_conf=0.741 | mean_entropy=0.599
+[Val] pred_hist: 0: 3 (3.4%) | 1: 15 (17.0%) | 2: 37 (42.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 7.7% | 1: 72.7% | 2: 83.9% | 3: 100.0%
+2025-10-02 00:51:53,576 | INFO | Validation Loss: 0.4862 | CE: 0.6285 | Focal: 0.3439 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 00:51:53,598 | INFO | \u2705 New best model saved: Medium_v3.3_77.27.pth
+2025-10-02 00:53:56,658 | INFO | 
+--- Epoch 49 finished: Avg Loss: 0.3332, Avg Acc: 77.72% ---
+2025-10-02 00:53:56,659 | INFO | [Train] acc=77.72% | mean_conf=0.780 | mean_entropy=0.506
+[Train] pred_hist: 0: 203 (34.5%) | 1: 153 (26.0%) | 2: 93 (15.8%) | 3: 139 (23.6%)
+[Train] per-class acc: 0: 85.3% | 1: 92.5% | 2: 41.2% | 3: 98.6%
+2025-10-02 00:54:10,748 | INFO | [Val] acc=71.59% | mean_conf=0.774 | mean_entropy=0.541
+[Val] pred_hist: 0: 24 (27.3%) | 1: 7 (8.0%) | 2: 21 (23.9%) | 3: 36 (40.9%)
+[Val] per-class acc: 0: 69.2% | 1: 45.5% | 2: 51.6% | 3: 100.0%
+2025-10-02 00:54:10,748 | INFO | Validation Loss: 0.5394 | CE: 0.6959 | Focal: 0.3829 | Acc: 71.59% | LR: 1.00e-04
+2025-10-02 00:56:29,564 | INFO | 
+--- Epoch 50 finished: Avg Loss: 0.3292, Avg Acc: 78.74% ---
+2025-10-02 00:56:29,565 | INFO | [Train] acc=78.74% | mean_conf=0.780 | mean_entropy=0.514
+[Train] pred_hist: 0: 223 (37.9%) | 1: 148 (25.2%) | 2: 83 (14.1%) | 3: 134 (22.8%)
+[Train] per-class acc: 0: 89.5% | 1: 90.4% | 2: 40.5% | 3: 99.2%
+2025-10-02 00:56:41,437 | INFO | [Val] acc=72.73% | mean_conf=0.775 | mean_entropy=0.522
+[Val] pred_hist: 0: 15 (17.0%) | 1: 5 (5.7%) | 2: 35 (39.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 38.5% | 1: 36.4% | 2: 71.0% | 3: 100.0%
+2025-10-02 00:56:41,437 | INFO | Validation Loss: 0.5592 | CE: 0.6974 | Focal: 0.4209 | Acc: 72.73% | LR: 1.00e-04
+2025-10-02 00:58:45,443 | INFO | 
+--- Epoch 51 finished: Avg Loss: 0.2917, Avg Acc: 79.76% ---
+2025-10-02 00:58:45,444 | INFO | [Train] acc=79.76% | mean_conf=0.799 | mean_entropy=0.463
+[Train] pred_hist: 0: 204 (34.7%) | 1: 146 (24.8%) | 2: 87 (14.8%) | 3: 151 (25.7%)
+[Train] per-class acc: 0: 89.6% | 1: 91.7% | 2: 42.2% | 3: 100.0%
+2025-10-02 00:58:55,377 | INFO | [Val] acc=73.86% | mean_conf=0.813 | mean_entropy=0.460
+[Val] pred_hist: 0: 26 (29.5%) | 1: 13 (14.8%) | 2: 16 (18.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 72.7% | 2: 41.9% | 3: 100.0%
+2025-10-02 00:58:55,377 | INFO | Validation Loss: 0.4097 | CE: 0.5700 | Focal: 0.2493 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 01:01:03,485 | INFO | 
+--- Epoch 52 finished: Avg Loss: 0.3664, Avg Acc: 80.10% ---
+2025-10-02 01:01:03,485 | INFO | [Train] acc=80.10% | mean_conf=0.791 | mean_entropy=0.498
+[Train] pred_hist: 0: 207 (35.2%) | 1: 184 (31.3%) | 2: 81 (13.8%) | 3: 116 (19.7%)
+[Train] per-class acc: 0: 89.5% | 1: 93.1% | 2: 44.8% | 3: 91.9%
+2025-10-02 01:01:13,419 | INFO | [Val] acc=65.91% | mean_conf=0.805 | mean_entropy=0.460
+[Val] pred_hist: 0: 19 (21.6%) | 1: 26 (29.5%) | 2: 9 (10.2%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 61.5% | 1: 81.8% | 2: 25.8% | 3: 100.0%
+2025-10-02 01:01:13,419 | INFO | Validation Loss: 0.6432 | CE: 0.8187 | Focal: 0.4677 | Acc: 65.91% | LR: 1.00e-04
+2025-10-02 01:04:03,101 | INFO | 
+--- Epoch 53 finished: Avg Loss: 0.3659, Avg Acc: 78.40% ---
+2025-10-02 01:04:03,102 | INFO | [Train] acc=78.40% | mean_conf=0.782 | mean_entropy=0.523
+[Train] pred_hist: 0: 212 (36.1%) | 1: 177 (30.1%) | 2: 61 (10.4%) | 3: 138 (23.5%)
+[Train] per-class acc: 0: 87.3% | 1: 91.5% | 2: 33.1% | 3: 99.3%
+2025-10-02 01:04:12,739 | INFO | [Val] acc=75.00% | mean_conf=0.793 | mean_entropy=0.468
+[Val] pred_hist: 0: 24 (27.3%) | 1: 18 (20.5%) | 2: 13 (14.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 90.9% | 2: 38.7% | 3: 100.0%
+2025-10-02 01:04:12,740 | INFO | Validation Loss: 0.4319 | CE: 0.5841 | Focal: 0.2797 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 01:06:14,138 | INFO | 
+--- Epoch 54 finished: Avg Loss: 0.2588, Avg Acc: 80.95% ---
+2025-10-02 01:06:14,138 | INFO | [Train] acc=80.95% | mean_conf=0.788 | mean_entropy=0.488
+[Train] pred_hist: 0: 205 (34.9%) | 1: 161 (27.4%) | 2: 80 (13.6%) | 3: 142 (24.1%)
+[Train] per-class acc: 0: 92.6% | 1: 96.6% | 2: 41.5% | 3: 99.3%
+2025-10-02 01:06:24,105 | INFO | [Val] acc=65.91% | mean_conf=0.890 | mean_entropy=0.301
+[Val] pred_hist: 0: 19 (21.6%) | 1: 31 (35.2%) | 2: 5 (5.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 100.0% | 2: 16.1% | 3: 100.0%
+2025-10-02 01:06:24,105 | INFO | Validation Loss: 0.7451 | CE: 0.9212 | Focal: 0.5691 | Acc: 65.91% | LR: 1.00e-04
+2025-10-02 01:08:32,063 | INFO | 
+--- Epoch 55 finished: Avg Loss: 0.3219, Avg Acc: 79.76% ---
+2025-10-02 01:08:32,063 | INFO | [Train] acc=79.76% | mean_conf=0.799 | mean_entropy=0.459
+[Train] pred_hist: 0: 206 (35.0%) | 1: 167 (28.4%) | 2: 78 (13.3%) | 3: 137 (23.3%)
+[Train] per-class acc: 0: 86.4% | 1: 92.8% | 2: 40.0% | 3: 100.0%
+2025-10-02 01:08:42,040 | INFO | [Val] acc=73.86% | mean_conf=0.822 | mean_entropy=0.424
+[Val] pred_hist: 0: 24 (27.3%) | 1: 13 (14.8%) | 2: 18 (20.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 63.6% | 2: 48.4% | 3: 100.0%
+2025-10-02 01:08:42,040 | INFO | Validation Loss: 0.5481 | CE: 0.6906 | Focal: 0.4057 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 01:10:38,971 | INFO | 
+--- Epoch 56 finished: Avg Loss: 0.2497, Avg Acc: 84.86% ---
+2025-10-02 01:10:38,972 | INFO | [Train] acc=84.86% | mean_conf=0.820 | mean_entropy=0.427
+[Train] pred_hist: 0: 196 (33.3%) | 1: 154 (26.2%) | 2: 76 (12.9%) | 3: 162 (27.6%)
+[Train] per-class acc: 0: 95.8% | 1: 97.1% | 2: 46.6% | 3: 100.0%
+2025-10-02 01:10:48,895 | INFO | [Val] acc=69.32% | mean_conf=0.835 | mean_entropy=0.412
+[Val] pred_hist: 0: 21 (23.9%) | 1: 22 (25.0%) | 2: 12 (13.6%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 81.8% | 2: 32.3% | 3: 100.0%
+2025-10-02 01:10:48,895 | INFO | Validation Loss: 0.5209 | CE: 0.6606 | Focal: 0.3813 | Acc: 69.32% | LR: 1.00e-04
+2025-10-02 01:13:14,943 | INFO | 
+--- Epoch 57 finished: Avg Loss: 0.2713, Avg Acc: 83.16% ---
+2025-10-02 01:13:14,943 | INFO | [Train] acc=83.16% | mean_conf=0.820 | mean_entropy=0.452
+[Train] pred_hist: 0: 197 (33.5%) | 1: 177 (30.1%) | 2: 85 (14.5%) | 3: 129 (21.9%)
+[Train] per-class acc: 0: 92.2% | 1: 94.2% | 2: 48.7% | 3: 99.2%
+2025-10-02 01:13:25,446 | INFO | [Val] acc=76.14% | mean_conf=0.817 | mean_entropy=0.448
+[Val] pred_hist: 0: 8 (9.1%) | 1: 4 (4.5%) | 2: 43 (48.9%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 30.8% | 1: 18.2% | 2: 90.3% | 3: 100.0%
+2025-10-02 01:13:25,446 | INFO | Validation Loss: 0.6074 | CE: 0.7073 | Focal: 0.5076 | Acc: 76.14% | LR: 1.00e-04
+2025-10-02 01:15:42,937 | INFO | 
+--- Epoch 58 finished: Avg Loss: 0.2397, Avg Acc: 83.67% ---
+2025-10-02 01:15:42,938 | INFO | [Train] acc=83.67% | mean_conf=0.849 | mean_entropy=0.385
+[Train] pred_hist: 0: 191 (32.5%) | 1: 184 (31.3%) | 2: 77 (13.1%) | 3: 136 (23.1%)
+[Train] per-class acc: 0: 89.9% | 1: 96.4% | 2: 44.9% | 3: 100.0%
+2025-10-02 01:15:53,044 | INFO | [Val] acc=73.86% | mean_conf=0.830 | mean_entropy=0.409
+[Val] pred_hist: 0: 26 (29.5%) | 1: 12 (13.6%) | 2: 17 (19.3%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 63.6% | 2: 48.4% | 3: 100.0%
+2025-10-02 01:15:53,044 | INFO | Validation Loss: 0.5552 | CE: 0.6953 | Focal: 0.4151 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 01:18:04,673 | INFO | 
+--- Epoch 59 finished: Avg Loss: 0.2525, Avg Acc: 82.31% ---
+2025-10-02 01:18:04,674 | INFO | [Train] acc=82.31% | mean_conf=0.832 | mean_entropy=0.403
+[Train] pred_hist: 0: 191 (32.5%) | 1: 165 (28.1%) | 2: 77 (13.1%) | 3: 155 (26.4%)
+[Train] per-class acc: 0: 89.9% | 1: 93.6% | 2: 42.0% | 3: 100.0%
+2025-10-02 01:18:14,703 | INFO | [Val] acc=71.59% | mean_conf=0.863 | mean_entropy=0.344
+[Val] pred_hist: 0: 28 (31.8%) | 1: 16 (18.2%) | 2: 11 (12.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 81.8% | 2: 32.3% | 3: 100.0%
+2025-10-02 01:18:14,703 | INFO | Validation Loss: 0.5172 | CE: 0.6593 | Focal: 0.3751 | Acc: 71.59% | LR: 1.00e-04
+2025-10-02 01:20:34,279 | INFO | 
+--- Epoch 60 finished: Avg Loss: 0.2995, Avg Acc: 81.46% ---
+2025-10-02 01:20:34,280 | INFO | [Train] acc=81.46% | mean_conf=0.819 | mean_entropy=0.423
+[Train] pred_hist: 0: 202 (34.4%) | 1: 180 (30.6%) | 2: 58 (9.9%) | 3: 148 (25.2%)
+[Train] per-class acc: 0: 89.7% | 1: 94.4% | 2: 36.8% | 3: 99.3%
+2025-10-02 01:20:44,059 | INFO | [Val] acc=79.55% | mean_conf=0.775 | mean_entropy=0.498
+[Val] pred_hist: 0: 28 (31.8%) | 1: 9 (10.2%) | 2: 18 (20.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 100.0% | 1: 63.6% | 2: 54.8% | 3: 100.0%
+2025-10-02 01:20:44,060 | INFO | Validation Loss: 0.4228 | CE: 0.5840 | Focal: 0.2617 | Acc: 79.55% | LR: 1.00e-04
+2025-10-02 01:20:44,068 | INFO | \u2705 New best model saved: Medium_v3.3_79.55.pth
+2025-10-02 01:22:57,072 | INFO | 
+--- Epoch 61 finished: Avg Loss: 0.2828, Avg Acc: 81.29% ---
+2025-10-02 01:22:57,073 | INFO | [Train] acc=81.29% | mean_conf=0.817 | mean_entropy=0.432
+[Train] pred_hist: 0: 207 (35.2%) | 1: 174 (29.6%) | 2: 56 (9.5%) | 3: 151 (25.7%)
+[Train] per-class acc: 0: 93.8% | 1: 97.3% | 2: 34.3% | 3: 96.8%
+2025-10-02 01:23:09,881 | INFO | [Val] acc=75.00% | mean_conf=0.798 | mean_entropy=0.445
+[Val] pred_hist: 0: 21 (23.9%) | 1: 6 (6.8%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 45.5% | 2: 64.5% | 3: 100.0%
+2025-10-02 01:23:09,882 | INFO | Validation Loss: 0.6077 | CE: 0.7438 | Focal: 0.4715 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 01:25:20,314 | INFO | 
+--- Epoch 62 finished: Avg Loss: 0.3345, Avg Acc: 80.10% ---
+2025-10-02 01:25:20,315 | INFO | [Train] acc=80.10% | mean_conf=0.803 | mean_entropy=0.456
+[Train] pred_hist: 0: 203 (34.5%) | 1: 137 (23.3%) | 2: 83 (14.1%) | 3: 165 (28.1%)
+[Train] per-class acc: 0: 87.0% | 1: 94.0% | 2: 43.4% | 3: 99.4%
+2025-10-02 01:25:30,448 | INFO | [Val] acc=77.27% | mean_conf=0.809 | mean_entropy=0.425
+[Val] pred_hist: 0: 21 (23.9%) | 1: 12 (13.6%) | 2: 22 (25.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 72.7% | 2: 58.1% | 3: 100.0%
+2025-10-02 01:25:30,448 | INFO | Validation Loss: 0.4152 | CE: 0.5299 | Focal: 0.3004 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 01:27:41,889 | INFO | 
+--- Epoch 63 finished: Avg Loss: 0.2469, Avg Acc: 81.80% ---
+2025-10-02 01:27:41,890 | INFO | [Train] acc=81.80% | mean_conf=0.822 | mean_entropy=0.422
+[Train] pred_hist: 0: 219 (37.2%) | 1: 142 (24.1%) | 2: 82 (13.9%) | 3: 145 (24.7%)
+[Train] per-class acc: 0: 92.5% | 1: 95.2% | 2: 42.9% | 3: 100.0%
+2025-10-02 01:27:51,809 | INFO | [Val] acc=77.27% | mean_conf=0.806 | mean_entropy=0.454
+[Val] pred_hist: 0: 13 (14.8%) | 1: 6 (6.8%) | 2: 36 (40.9%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 27.3% | 2: 80.6% | 3: 100.0%
+2025-10-02 01:27:51,809 | INFO | Validation Loss: 0.5683 | CE: 0.6777 | Focal: 0.4589 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 01:30:11,850 | INFO | 
+--- Epoch 64 finished: Avg Loss: 0.2329, Avg Acc: 85.71% ---
+2025-10-02 01:30:11,851 | INFO | [Train] acc=85.71% | mean_conf=0.852 | mean_entropy=0.370
+[Train] pred_hist: 0: 185 (31.5%) | 1: 173 (29.4%) | 2: 70 (11.9%) | 3: 160 (27.2%)
+[Train] per-class acc: 0: 93.9% | 1: 96.1% | 2: 46.1% | 3: 100.0%
+2025-10-02 01:30:24,373 | INFO | [Val] acc=77.27% | mean_conf=0.815 | mean_entropy=0.433
+[Val] pred_hist: 0: 19 (21.6%) | 1: 6 (6.8%) | 2: 30 (34.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 36.4% | 2: 71.0% | 3: 100.0%
+2025-10-02 01:30:24,373 | INFO | Validation Loss: 0.5408 | CE: 0.6636 | Focal: 0.4180 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 01:32:43,376 | INFO | 
+--- Epoch 65 finished: Avg Loss: 0.2035, Avg Acc: 84.35% ---
+2025-10-02 01:32:43,377 | INFO | [Train] acc=84.35% | mean_conf=0.841 | mean_entropy=0.390
+[Train] pred_hist: 0: 211 (35.9%) | 1: 180 (30.6%) | 2: 63 (10.7%) | 3: 134 (22.8%)
+[Train] per-class acc: 0: 96.6% | 1: 97.0% | 2: 40.1% | 3: 100.0%
+2025-10-02 01:32:56,114 | INFO | [Val] acc=77.27% | mean_conf=0.850 | mean_entropy=0.357
+[Val] pred_hist: 0: 20 (22.7%) | 1: 17 (19.3%) | 2: 18 (20.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 90.9% | 2: 51.6% | 3: 100.0%
+2025-10-02 01:32:56,114 | INFO | Validation Loss: 0.4459 | CE: 0.5562 | Focal: 0.3355 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 01:35:28,945 | INFO | 
+--- Epoch 66 finished: Avg Loss: 0.2461, Avg Acc: 83.67% ---
+2025-10-02 01:35:28,946 | INFO | [Train] acc=83.67% | mean_conf=0.833 | mean_entropy=0.399
+[Train] pred_hist: 0: 176 (29.9%) | 1: 170 (28.9%) | 2: 98 (16.7%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 93.4% | 1: 94.5% | 2: 51.2% | 3: 99.3%
+2025-10-02 01:35:38,896 | INFO | [Val] acc=64.77% | mean_conf=0.838 | mean_entropy=0.385
+[Val] pred_hist: 0: 26 (29.5%) | 1: 23 (26.1%) | 2: 6 (6.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 81.8% | 2: 16.1% | 3: 100.0%
+2025-10-02 01:35:38,896 | INFO | Validation Loss: 0.4830 | CE: 0.6476 | Focal: 0.3184 | Acc: 64.77% | LR: 1.00e-04
+2025-10-02 01:38:24,267 | INFO | 
+--- Epoch 67 finished: Avg Loss: 0.2278, Avg Acc: 83.33% ---
+2025-10-02 01:38:24,268 | INFO | [Train] acc=83.33% | mean_conf=0.841 | mean_entropy=0.386
+[Train] pred_hist: 0: 209 (35.5%) | 1: 154 (26.2%) | 2: 82 (13.9%) | 3: 143 (24.3%)
+[Train] per-class acc: 0: 94.3% | 1: 94.4% | 2: 45.3% | 3: 100.0%
+2025-10-02 01:38:34,229 | INFO | [Val] acc=71.59% | mean_conf=0.838 | mean_entropy=0.386
+[Val] pred_hist: 0: 29 (33.0%) | 1: 8 (9.1%) | 2: 18 (20.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 54.5% | 2: 45.2% | 3: 100.0%
+2025-10-02 01:38:34,229 | INFO | Validation Loss: 0.6290 | CE: 0.7712 | Focal: 0.4867 | Acc: 71.59% | LR: 1.00e-04
+2025-10-02 01:40:51,139 | INFO | 
+--- Epoch 68 finished: Avg Loss: 0.2168, Avg Acc: 83.50% ---
+2025-10-02 01:40:51,140 | INFO | [Train] acc=83.50% | mean_conf=0.851 | mean_entropy=0.359
+[Train] pred_hist: 0: 206 (35.0%) | 1: 164 (27.9%) | 2: 76 (12.9%) | 3: 142 (24.1%)
+[Train] per-class acc: 0: 95.1% | 1: 96.7% | 2: 43.6% | 3: 99.3%
+2025-10-02 01:41:01,218 | INFO | [Val] acc=79.55% | mean_conf=0.824 | mean_entropy=0.408
+[Val] pred_hist: 0: 21 (23.9%) | 1: 11 (12.5%) | 2: 23 (26.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 61.3% | 3: 100.0%
+2025-10-02 01:41:01,218 | INFO | Validation Loss: 0.4460 | CE: 0.5657 | Focal: 0.3262 | Acc: 79.55% | LR: 1.00e-04
+2025-10-02 01:43:22,878 | INFO | 
+--- Epoch 69 finished: Avg Loss: 0.1807, Avg Acc: 87.24% ---
+2025-10-02 01:43:22,879 | INFO | [Train] acc=87.24% | mean_conf=0.857 | mean_entropy=0.344
+[Train] pred_hist: 0: 202 (34.4%) | 1: 152 (25.9%) | 2: 86 (14.6%) | 3: 148 (25.2%)
+[Train] per-class acc: 0: 95.6% | 1: 95.9% | 2: 54.4% | 3: 100.0%
+2025-10-02 01:43:37,418 | INFO | [Val] acc=75.00% | mean_conf=0.844 | mean_entropy=0.370
+[Val] pred_hist: 0: 10 (11.4%) | 1: 7 (8.0%) | 2: 37 (42.0%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 30.8% | 1: 45.5% | 2: 77.4% | 3: 100.0%
+2025-10-02 01:43:37,418 | INFO | Validation Loss: 0.7262 | CE: 0.8245 | Focal: 0.6279 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 01:45:58,374 | INFO | 
+--- Epoch 70 finished: Avg Loss: 0.2331, Avg Acc: 89.97% ---
+2025-10-02 01:45:58,374 | INFO | [Train] acc=89.97% | mean_conf=0.885 | mean_entropy=0.301
+[Train] pred_hist: 0: 173 (29.4%) | 1: 161 (27.4%) | 2: 93 (15.8%) | 3: 161 (27.4%)
+[Train] per-class acc: 0: 92.6% | 1: 96.7% | 2: 67.5% | 3: 98.8%
+2025-10-02 01:46:09,320 | INFO | [Val] acc=72.73% | mean_conf=0.825 | mean_entropy=0.448
+[Val] pred_hist: 0: 17 (19.3%) | 1: 8 (9.1%) | 2: 27 (30.7%) | 3: 36 (40.9%)
+[Val] per-class acc: 0: 46.2% | 1: 36.4% | 2: 67.7% | 3: 100.0%
+2025-10-02 01:46:09,320 | INFO | Validation Loss: 0.6993 | CE: 0.8240 | Focal: 0.5746 | Acc: 72.73% | LR: 1.00e-04
+2025-10-02 01:48:52,523 | INFO | 
+--- Epoch 71 finished: Avg Loss: 0.2117, Avg Acc: 85.71% ---
+2025-10-02 01:48:52,524 | INFO | [Train] acc=85.71% | mean_conf=0.846 | mean_entropy=0.383
+[Train] pred_hist: 0: 189 (32.1%) | 1: 145 (24.7%) | 2: 89 (15.1%) | 3: 165 (28.1%)
+[Train] per-class acc: 0: 92.5% | 1: 97.7% | 2: 52.1% | 3: 100.0%
+2025-10-02 01:49:02,813 | INFO | [Val] acc=70.45% | mean_conf=0.870 | mean_entropy=0.334
+[Val] pred_hist: 0: 29 (33.0%) | 1: 6 (6.8%) | 2: 20 (22.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 27.3% | 2: 51.6% | 3: 100.0%
+2025-10-02 01:49:02,813 | INFO | Validation Loss: 0.8185 | CE: 0.9410 | Focal: 0.6960 | Acc: 70.45% | LR: 1.00e-04
+2025-10-02 01:52:01,757 | INFO | 
+--- Epoch 72 finished: Avg Loss: 0.2105, Avg Acc: 84.69% ---
+2025-10-02 01:52:01,758 | INFO | [Train] acc=84.69% | mean_conf=0.858 | mean_entropy=0.346
+[Train] pred_hist: 0: 207 (35.2%) | 1: 157 (26.7%) | 2: 85 (14.5%) | 3: 139 (23.6%)
+[Train] per-class acc: 0: 94.8% | 1: 97.2% | 2: 48.7% | 3: 100.0%
+2025-10-02 01:52:16,584 | INFO | [Val] acc=78.41% | mean_conf=0.855 | mean_entropy=0.350
+[Val] pred_hist: 0: 22 (25.0%) | 1: 5 (5.7%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 36.4% | 2: 71.0% | 3: 100.0%
+2025-10-02 01:52:16,584 | INFO | Validation Loss: 0.7640 | CE: 0.8831 | Focal: 0.6449 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 01:54:37,306 | INFO | 
+--- Epoch 73 finished: Avg Loss: 0.2490, Avg Acc: 86.39% ---
+2025-10-02 01:54:37,307 | INFO | [Train] acc=86.39% | mean_conf=0.840 | mean_entropy=0.389
+[Train] pred_hist: 0: 194 (33.0%) | 1: 164 (27.9%) | 2: 96 (16.3%) | 3: 134 (22.8%)
+[Train] per-class acc: 0: 91.7% | 1: 97.4% | 2: 57.2% | 3: 99.3%
+2025-10-02 01:54:48,830 | INFO | [Val] acc=79.55% | mean_conf=0.856 | mean_entropy=0.358
+[Val] pred_hist: 0: 19 (21.6%) | 1: 11 (12.5%) | 2: 25 (28.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 63.6% | 2: 67.7% | 3: 100.0%
+2025-10-02 01:54:48,830 | INFO | Validation Loss: 0.4943 | CE: 0.6121 | Focal: 0.3764 | Acc: 79.55% | LR: 1.00e-04
+2025-10-02 01:56:58,544 | INFO | 
+--- Epoch 74 finished: Avg Loss: 0.1865, Avg Acc: 88.44% ---
+2025-10-02 01:56:58,545 | INFO | [Train] acc=88.44% | mean_conf=0.859 | mean_entropy=0.350
+[Train] pred_hist: 0: 172 (29.3%) | 1: 169 (28.7%) | 2: 107 (18.2%) | 3: 140 (23.8%)
+[Train] per-class acc: 0: 94.3% | 1: 97.4% | 2: 63.4% | 3: 100.0%
+2025-10-02 01:57:09,025 | INFO | [Val] acc=82.95% | mean_conf=0.872 | mean_entropy=0.319
+[Val] pred_hist: 0: 18 (20.5%) | 1: 12 (13.6%) | 2: 25 (28.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 81.8% | 2: 67.7% | 3: 100.0%
+2025-10-02 01:57:09,025 | INFO | Validation Loss: 0.4737 | CE: 0.5681 | Focal: 0.3794 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 01:57:09,042 | INFO | \u2705 New best model saved: Medium_v3.3_82.95.pth
+2025-10-02 01:59:54,181 | INFO | 
+--- Epoch 75 finished: Avg Loss: 0.1895, Avg Acc: 88.10% ---
+2025-10-02 01:59:54,182 | INFO | [Train] acc=88.10% | mean_conf=0.861 | mean_entropy=0.339
+[Train] pred_hist: 0: 166 (28.2%) | 1: 155 (26.4%) | 2: 128 (21.8%) | 3: 139 (23.6%)
+[Train] per-class acc: 0: 93.7% | 1: 98.6% | 2: 66.3% | 3: 100.0%
+2025-10-02 02:00:08,033 | INFO | [Val] acc=80.68% | mean_conf=0.878 | mean_entropy=0.300
+[Val] pred_hist: 0: 15 (17.0%) | 1: 17 (19.3%) | 2: 23 (26.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 81.8% | 2: 64.5% | 3: 100.0%
+2025-10-02 02:00:08,033 | INFO | Validation Loss: 0.4279 | CE: 0.5168 | Focal: 0.3389 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 02:02:40,530 | INFO | 
+--- Epoch 76 finished: Avg Loss: 0.1913, Avg Acc: 87.76% ---
+2025-10-02 02:02:40,530 | INFO | [Train] acc=87.76% | mean_conf=0.880 | mean_entropy=0.305
+[Train] pred_hist: 0: 174 (29.6%) | 1: 146 (24.8%) | 2: 106 (18.0%) | 3: 162 (27.6%)
+[Train] per-class acc: 0: 91.8% | 1: 97.1% | 2: 62.5% | 3: 100.0%
+2025-10-02 02:02:50,492 | INFO | [Val] acc=57.95% | mean_conf=0.845 | mean_entropy=0.380
+[Val] pred_hist: 0: 42 (47.7%) | 1: 7 (8.0%) | 2: 5 (5.7%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 92.3% | 1: 18.2% | 2: 12.9% | 3: 100.0%
+2025-10-02 02:02:50,492 | INFO | Validation Loss: 0.9195 | CE: 1.1099 | Focal: 0.7291 | Acc: 57.95% | LR: 1.00e-04
+2025-10-02 02:05:14,562 | INFO | 
+--- Epoch 77 finished: Avg Loss: 0.3529, Avg Acc: 77.72% ---
+2025-10-02 02:05:14,562 | INFO | [Train] acc=77.72% | mean_conf=0.814 | mean_entropy=0.451
+[Train] pred_hist: 0: 179 (30.4%) | 1: 180 (30.6%) | 2: 74 (12.6%) | 3: 155 (26.4%)
+[Train] per-class acc: 0: 85.2% | 1: 88.9% | 2: 38.6% | 3: 95.0%
+2025-10-02 02:05:26,110 | INFO | [Val] acc=75.00% | mean_conf=0.808 | mean_entropy=0.412
+[Val] pred_hist: 0: 16 (18.2%) | 1: 17 (19.3%) | 2: 22 (25.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 72.7% | 2: 58.1% | 3: 100.0%
+2025-10-02 02:05:26,110 | INFO | Validation Loss: 0.6181 | CE: 0.7519 | Focal: 0.4844 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 02:08:01,103 | INFO | 
+--- Epoch 78 finished: Avg Loss: 0.2082, Avg Acc: 86.73% ---
+2025-10-02 02:08:01,104 | INFO | [Train] acc=86.73% | mean_conf=0.841 | mean_entropy=0.389
+[Train] pred_hist: 0: 203 (34.5%) | 1: 151 (25.7%) | 2: 98 (16.7%) | 3: 136 (23.1%)
+[Train] per-class acc: 0: 92.6% | 1: 97.8% | 2: 58.8% | 3: 100.0%
+2025-10-02 02:08:10,937 | INFO | [Val] acc=80.68% | mean_conf=0.885 | mean_entropy=0.296
+[Val] pred_hist: 0: 16 (18.2%) | 1: 13 (14.8%) | 2: 26 (29.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 81.8% | 2: 67.7% | 3: 100.0%
+2025-10-02 02:08:10,937 | INFO | Validation Loss: 0.4919 | CE: 0.5780 | Focal: 0.4058 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 02:10:36,602 | INFO | 
+--- Epoch 79 finished: Avg Loss: 0.1777, Avg Acc: 87.76% ---
+2025-10-02 02:10:36,602 | INFO | [Train] acc=87.76% | mean_conf=0.871 | mean_entropy=0.322
+[Train] pred_hist: 0: 197 (33.5%) | 1: 136 (23.1%) | 2: 98 (16.7%) | 3: 157 (26.7%)
+[Train] per-class acc: 0: 95.4% | 1: 97.6% | 2: 59.3% | 3: 99.4%
+2025-10-02 02:10:46,522 | INFO | [Val] acc=78.41% | mean_conf=0.881 | mean_entropy=0.306
+[Val] pred_hist: 0: 22 (25.0%) | 1: 9 (10.2%) | 2: 24 (27.3%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 54.5% | 2: 64.5% | 3: 100.0%
+2025-10-02 02:10:46,522 | INFO | Validation Loss: 0.5885 | CE: 0.6892 | Focal: 0.4878 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 02:13:53,822 | INFO | 
+--- Epoch 80 finished: Avg Loss: 0.1482, Avg Acc: 90.99% ---
+2025-10-02 02:13:53,822 | INFO | [Train] acc=90.99% | mean_conf=0.893 | mean_entropy=0.290
+[Train] pred_hist: 0: 188 (32.0%) | 1: 156 (26.5%) | 2: 100 (17.0%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 97.5% | 1: 98.0% | 2: 66.9% | 3: 100.0%
+2025-10-02 02:14:05,015 | INFO | [Val] acc=70.45% | mean_conf=0.877 | mean_entropy=0.305
+[Val] pred_hist: 0: 22 (25.0%) | 1: 22 (25.0%) | 2: 11 (12.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 81.8% | 2: 29.0% | 3: 100.0%
+2025-10-02 02:14:05,015 | INFO | Validation Loss: 0.5435 | CE: 0.6890 | Focal: 0.3981 | Acc: 70.45% | LR: 1.00e-04
+2025-10-02 02:16:05,113 | INFO | 
+--- Epoch 81 finished: Avg Loss: 0.1263, Avg Acc: 91.50% ---
+2025-10-02 02:16:05,113 | INFO | [Train] acc=91.50% | mean_conf=0.901 | mean_entropy=0.269
+[Train] pred_hist: 0: 179 (30.4%) | 1: 166 (28.2%) | 2: 103 (17.5%) | 3: 140 (23.8%)
+[Train] per-class acc: 0: 96.1% | 1: 98.7% | 2: 69.6% | 3: 100.0%
+2025-10-02 02:16:15,146 | INFO | [Val] acc=81.82% | mean_conf=0.917 | mean_entropy=0.235
+[Val] pred_hist: 0: 17 (19.3%) | 1: 13 (14.8%) | 2: 25 (28.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 72.7% | 2: 67.7% | 3: 100.0%
+2025-10-02 02:16:15,147 | INFO | Validation Loss: 0.4861 | CE: 0.5682 | Focal: 0.4039 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 02:18:21,427 | INFO | 
+--- Epoch 82 finished: Avg Loss: 0.2142, Avg Acc: 86.73% ---
+2025-10-02 02:18:21,427 | INFO | [Train] acc=86.73% | mean_conf=0.875 | mean_entropy=0.325
+[Train] pred_hist: 0: 198 (33.7%) | 1: 166 (28.2%) | 2: 88 (15.0%) | 3: 136 (23.1%)
+[Train] per-class acc: 0: 94.5% | 1: 96.6% | 2: 55.3% | 3: 99.3%
+2025-10-02 02:18:31,637 | INFO | [Val] acc=81.82% | mean_conf=0.893 | mean_entropy=0.288
+[Val] pred_hist: 0: 18 (20.5%) | 1: 10 (11.4%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 63.6% | 2: 71.0% | 3: 100.0%
+2025-10-02 02:18:31,637 | INFO | Validation Loss: 0.5405 | CE: 0.6348 | Focal: 0.4461 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 02:21:52,741 | INFO | 
+--- Epoch 83 finished: Avg Loss: 0.2711, Avg Acc: 83.84% ---
+2025-10-02 02:21:52,741 | INFO | [Train] acc=83.84% | mean_conf=0.856 | mean_entropy=0.359
+[Train] pred_hist: 0: 200 (34.0%) | 1: 152 (25.9%) | 2: 89 (15.1%) | 3: 147 (25.0%)
+[Train] per-class acc: 0: 91.1% | 1: 95.5% | 2: 51.3% | 3: 98.6%
+2025-10-02 02:22:03,145 | INFO | [Val] acc=69.32% | mean_conf=0.841 | mean_entropy=0.389
+[Val] pred_hist: 0: 26 (29.5%) | 1: 18 (20.5%) | 2: 11 (12.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 81.8% | 2: 29.0% | 3: 100.0%
+2025-10-02 02:22:03,145 | INFO | Validation Loss: 0.5049 | CE: 0.6634 | Focal: 0.3465 | Acc: 69.32% | LR: 1.00e-04
+2025-10-02 02:24:04,161 | INFO | 
+--- Epoch 84 finished: Avg Loss: 0.2005, Avg Acc: 88.27% ---
+2025-10-02 02:24:04,161 | INFO | [Train] acc=88.27% | mean_conf=0.857 | mean_entropy=0.359
+[Train] pred_hist: 0: 185 (31.5%) | 1: 154 (26.2%) | 2: 102 (17.3%) | 3: 147 (25.0%)
+[Train] per-class acc: 0: 93.9% | 1: 98.6% | 2: 62.1% | 3: 100.0%
+2025-10-02 02:24:14,228 | INFO | [Val] acc=78.41% | mean_conf=0.856 | mean_entropy=0.350
+[Val] pred_hist: 0: 18 (20.5%) | 1: 8 (9.1%) | 2: 28 (31.8%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 76.9% | 1: 45.5% | 2: 67.7% | 3: 100.0%
+2025-10-02 02:24:14,228 | INFO | Validation Loss: 0.5763 | CE: 0.6864 | Focal: 0.4663 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 02:26:15,933 | INFO | 
+--- Epoch 85 finished: Avg Loss: 0.1738, Avg Acc: 88.10% ---
+2025-10-02 02:26:15,934 | INFO | [Train] acc=88.10% | mean_conf=0.863 | mean_entropy=0.335
+[Train] pred_hist: 0: 177 (30.1%) | 1: 154 (26.2%) | 2: 116 (19.7%) | 3: 141 (24.0%)
+[Train] per-class acc: 0: 94.8% | 1: 98.6% | 2: 63.7% | 3: 100.0%
+2025-10-02 02:26:26,105 | INFO | [Val] acc=75.00% | mean_conf=0.884 | mean_entropy=0.286
+[Val] pred_hist: 0: 16 (18.2%) | 1: 17 (19.3%) | 2: 21 (23.9%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 61.5% | 1: 81.8% | 2: 51.6% | 3: 100.0%
+2025-10-02 02:26:26,105 | INFO | Validation Loss: 0.5748 | CE: 0.6834 | Focal: 0.4661 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 02:28:29,227 | INFO | 
+--- Epoch 86 finished: Avg Loss: 0.1855, Avg Acc: 87.24% ---
+2025-10-02 02:28:29,228 | INFO | [Train] acc=87.24% | mean_conf=0.878 | mean_entropy=0.312
+[Train] pred_hist: 0: 171 (29.1%) | 1: 174 (29.6%) | 2: 108 (18.4%) | 3: 135 (23.0%)
+[Train] per-class acc: 0: 93.4% | 1: 96.3% | 2: 62.6% | 3: 98.5%
+2025-10-02 02:28:40,703 | INFO | [Val] acc=76.14% | mean_conf=0.860 | mean_entropy=0.338
+[Val] pred_hist: 0: 19 (21.6%) | 1: 15 (17.0%) | 2: 21 (23.9%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 63.6% | 2: 58.1% | 3: 100.0%
+2025-10-02 02:28:40,704 | INFO | Validation Loss: 0.5972 | CE: 0.7171 | Focal: 0.4772 | Acc: 76.14% | LR: 1.00e-04
+2025-10-02 02:30:39,216 | INFO | 
+--- Epoch 87 finished: Avg Loss: 0.1833, Avg Acc: 88.44% ---
+2025-10-02 02:30:39,217 | INFO | [Train] acc=88.44% | mean_conf=0.880 | mean_entropy=0.306
+[Train] pred_hist: 0: 177 (30.1%) | 1: 154 (26.2%) | 2: 112 (19.0%) | 3: 145 (24.7%)
+[Train] per-class acc: 0: 93.2% | 1: 97.3% | 2: 66.7% | 3: 97.3%
+2025-10-02 02:31:10,918 | INFO | [Val] acc=77.27% | mean_conf=0.862 | mean_entropy=0.342
+[Val] pred_hist: 0: 23 (26.1%) | 1: 15 (17.0%) | 2: 17 (19.3%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 90.9% | 2: 48.4% | 3: 100.0%
+2025-10-02 02:31:10,918 | INFO | Validation Loss: 0.4821 | CE: 0.6009 | Focal: 0.3632 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 02:35:49,285 | INFO | 
+--- Epoch 88 finished: Avg Loss: 0.1443, Avg Acc: 92.18% ---
+2025-10-02 02:35:49,285 | INFO | [Train] acc=92.18% | mean_conf=0.888 | mean_entropy=0.289
+[Train] pred_hist: 0: 166 (28.2%) | 1: 154 (26.2%) | 2: 113 (19.2%) | 3: 155 (26.4%)
+[Train] per-class acc: 0: 97.1% | 1: 98.0% | 2: 73.6% | 3: 99.4%
+2025-10-02 02:35:59,260 | INFO | [Val] acc=73.86% | mean_conf=0.887 | mean_entropy=0.277
+[Val] pred_hist: 0: 29 (33.0%) | 1: 9 (10.2%) | 2: 17 (19.3%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 45.5% | 2: 48.4% | 3: 100.0%
+2025-10-02 02:35:59,260 | INFO | Validation Loss: 0.7312 | CE: 0.8568 | Focal: 0.6056 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 02:37:58,229 | INFO | 
+--- Epoch 89 finished: Avg Loss: 0.1351, Avg Acc: 90.48% ---
+2025-10-02 02:37:58,230 | INFO | [Train] acc=90.48% | mean_conf=0.892 | mean_entropy=0.276
+[Train] pred_hist: 0: 162 (27.6%) | 1: 166 (28.2%) | 2: 117 (19.9%) | 3: 143 (24.3%)
+[Train] per-class acc: 0: 94.2% | 1: 97.5% | 2: 70.7% | 3: 100.0%
+2025-10-02 02:38:08,412 | INFO | [Val] acc=78.41% | mean_conf=0.909 | mean_entropy=0.245
+[Val] pred_hist: 0: 18 (20.5%) | 1: 9 (10.2%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 45.5% | 2: 67.7% | 3: 100.0%
+2025-10-02 02:38:08,412 | INFO | Validation Loss: 0.6868 | CE: 0.7762 | Focal: 0.5974 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 02:40:02,557 | INFO | 
+--- Epoch 90 finished: Avg Loss: 0.1721, Avg Acc: 88.95% ---
+2025-10-02 02:40:02,557 | INFO | [Train] acc=88.95% | mean_conf=0.895 | mean_entropy=0.270
+[Train] pred_hist: 0: 194 (33.0%) | 1: 142 (24.1%) | 2: 97 (16.5%) | 3: 155 (26.4%)
+[Train] per-class acc: 0: 93.8% | 1: 97.7% | 2: 62.6% | 3: 100.0%
+2025-10-02 02:40:12,554 | INFO | [Val] acc=80.68% | mean_conf=0.871 | mean_entropy=0.319
+[Val] pred_hist: 0: 17 (19.3%) | 1: 10 (11.4%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 54.5% | 2: 71.0% | 3: 100.0%
+2025-10-02 02:40:12,555 | INFO | Validation Loss: 0.6412 | CE: 0.7468 | Focal: 0.5356 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 02:42:08,643 | INFO | 
+--- Epoch 91 finished: Avg Loss: 0.1176, Avg Acc: 93.20% ---
+2025-10-02 02:42:08,644 | INFO | [Train] acc=93.20% | mean_conf=0.907 | mean_entropy=0.247
+[Train] pred_hist: 0: 163 (27.7%) | 1: 144 (24.5%) | 2: 114 (19.4%) | 3: 167 (28.4%)
+[Train] per-class acc: 0: 97.9% | 1: 97.8% | 2: 77.3% | 3: 98.8%
+2025-10-02 02:42:18,902 | INFO | [Val] acc=80.68% | mean_conf=0.930 | mean_entropy=0.195
+[Val] pred_hist: 0: 10 (11.4%) | 1: 12 (13.6%) | 2: 33 (37.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 46.2% | 1: 63.6% | 2: 80.6% | 3: 100.0%
+2025-10-02 02:42:18,902 | INFO | Validation Loss: 0.7008 | CE: 0.7661 | Focal: 0.6354 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 02:44:16,465 | INFO | 
+--- Epoch 92 finished: Avg Loss: 0.1117, Avg Acc: 93.88% ---
+2025-10-02 02:44:16,466 | INFO | [Train] acc=93.88% | mean_conf=0.920 | mean_entropy=0.223
+[Train] pred_hist: 0: 150 (25.5%) | 1: 141 (24.0%) | 2: 138 (23.5%) | 3: 159 (27.0%)
+[Train] per-class acc: 0: 94.8% | 1: 97.9% | 2: 83.1% | 3: 100.0%
+2025-10-02 02:44:26,327 | INFO | [Val] acc=72.73% | mean_conf=0.913 | mean_entropy=0.233
+[Val] pred_hist: 0: 17 (19.3%) | 1: 22 (25.0%) | 2: 15 (17.0%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 69.2% | 1: 81.8% | 2: 41.9% | 3: 100.0%
+2025-10-02 02:44:26,327 | INFO | Validation Loss: 0.6986 | CE: 0.8088 | Focal: 0.5885 | Acc: 72.73% | LR: 1.00e-04
+2025-10-02 02:46:23,952 | INFO | 
+--- Epoch 93 finished: Avg Loss: 0.2255, Avg Acc: 88.95% ---
+2025-10-02 02:46:23,953 | INFO | [Train] acc=88.95% | mean_conf=0.889 | mean_entropy=0.283
+[Train] pred_hist: 0: 168 (28.6%) | 1: 172 (29.3%) | 2: 109 (18.5%) | 3: 139 (23.6%)
+[Train] per-class acc: 0: 94.9% | 1: 96.2% | 2: 66.4% | 3: 99.3%
+2025-10-02 02:46:34,164 | INFO | [Val] acc=78.41% | mean_conf=0.883 | mean_entropy=0.279
+[Val] pred_hist: 0: 13 (14.8%) | 1: 13 (14.8%) | 2: 29 (33.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 72.7% | 2: 67.7% | 3: 100.0%
+2025-10-02 02:46:34,164 | INFO | Validation Loss: 0.5160 | CE: 0.6112 | Focal: 0.4209 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 02:48:32,280 | INFO | 
+--- Epoch 94 finished: Avg Loss: 0.1572, Avg Acc: 91.84% ---
+2025-10-02 02:48:32,281 | INFO | [Train] acc=91.84% | mean_conf=0.890 | mean_entropy=0.283
+[Train] pred_hist: 0: 183 (31.1%) | 1: 143 (24.3%) | 2: 105 (17.9%) | 3: 157 (26.7%)
+[Train] per-class acc: 0: 96.8% | 1: 98.5% | 2: 71.1% | 3: 100.0%
+2025-10-02 02:48:42,456 | INFO | [Val] acc=81.82% | mean_conf=0.909 | mean_entropy=0.238
+[Val] pred_hist: 0: 18 (20.5%) | 1: 10 (11.4%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 63.6% | 2: 71.0% | 3: 100.0%
+2025-10-02 02:48:42,456 | INFO | Validation Loss: 0.6056 | CE: 0.6947 | Focal: 0.5164 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 02:50:37,779 | INFO | 
+--- Epoch 95 finished: Avg Loss: 0.2395, Avg Acc: 86.39% ---
+2025-10-02 02:50:37,779 | INFO | [Train] acc=86.39% | mean_conf=0.889 | mean_entropy=0.283
+[Train] pred_hist: 0: 162 (27.6%) | 1: 178 (30.3%) | 2: 97 (16.5%) | 3: 151 (25.7%)
+[Train] per-class acc: 0: 92.4% | 1: 94.7% | 2: 58.5% | 3: 99.3%
+2025-10-02 02:50:47,682 | INFO | [Val] acc=73.86% | mean_conf=0.826 | mean_entropy=0.416
+[Val] pred_hist: 0: 9 (10.2%) | 1: 14 (15.9%) | 2: 24 (27.3%) | 3: 41 (46.6%)
+[Val] per-class acc: 0: 38.5% | 1: 72.7% | 2: 61.3% | 3: 100.0%
+2025-10-02 02:50:47,682 | INFO | Validation Loss: 0.9981 | CE: 1.1295 | Focal: 0.8667 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 02:52:53,307 | INFO | 
+--- Epoch 96 finished: Avg Loss: 0.2531, Avg Acc: 86.39% ---
+2025-10-02 02:52:53,308 | INFO | [Train] acc=86.39% | mean_conf=0.835 | mean_entropy=0.405
+[Train] pred_hist: 0: 200 (34.0%) | 1: 151 (25.7%) | 2: 101 (17.2%) | 3: 136 (23.1%)
+[Train] per-class acc: 0: 94.8% | 1: 95.7% | 2: 59.1% | 3: 99.3%
+2025-10-02 02:53:03,361 | INFO | [Val] acc=78.41% | mean_conf=0.869 | mean_entropy=0.320
+[Val] pred_hist: 0: 15 (17.0%) | 1: 13 (14.8%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 54.5% | 2: 67.7% | 3: 100.0%
+2025-10-02 02:53:03,361 | INFO | Validation Loss: 0.4679 | CE: 0.5620 | Focal: 0.3737 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 02:54:59,599 | INFO | 
+--- Epoch 97 finished: Avg Loss: 0.1502, Avg Acc: 90.82% ---
+2025-10-02 02:54:59,599 | INFO | [Train] acc=90.82% | mean_conf=0.897 | mean_entropy=0.273
+[Train] pred_hist: 0: 167 (28.4%) | 1: 146 (24.8%) | 2: 131 (22.3%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 93.2% | 1: 97.1% | 2: 74.7% | 3: 100.0%
+2025-10-02 02:55:09,585 | INFO | [Val] acc=64.77% | mean_conf=0.893 | mean_entropy=0.279
+[Val] pred_hist: 0: 36 (40.9%) | 1: 14 (15.9%) | 2: 5 (5.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 72.7% | 2: 16.1% | 3: 100.0%
+2025-10-02 02:55:09,585 | INFO | Validation Loss: 0.7945 | CE: 0.9709 | Focal: 0.6180 | Acc: 64.77% | LR: 1.00e-04
+2025-10-02 02:57:05,704 | INFO | 
+--- Epoch 98 finished: Avg Loss: 0.1578, Avg Acc: 88.78% ---
+2025-10-02 02:57:05,705 | INFO | [Train] acc=88.78% | mean_conf=0.886 | mean_entropy=0.289
+[Train] pred_hist: 0: 181 (30.8%) | 1: 151 (25.7%) | 2: 101 (17.2%) | 3: 155 (26.4%)
+[Train] per-class acc: 0: 95.8% | 1: 98.6% | 2: 61.6% | 3: 100.0%
+2025-10-02 02:57:15,732 | INFO | [Val] acc=85.23% | mean_conf=0.895 | mean_entropy=0.263
+[Val] pred_hist: 0: 14 (15.9%) | 1: 15 (17.0%) | 2: 26 (29.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 90.9% | 2: 74.2% | 3: 100.0%
+2025-10-02 02:57:15,732 | INFO | Validation Loss: 0.4743 | CE: 0.5660 | Focal: 0.3827 | Acc: 85.23% | LR: 1.00e-04
+2025-10-02 02:57:15,748 | INFO | \u2705 New best model saved: Medium_v3.3_85.23.pth
+2025-10-02 02:59:16,092 | INFO | 
+--- Epoch 99 finished: Avg Loss: 0.1090, Avg Acc: 93.37% ---
+2025-10-02 02:59:16,092 | INFO | [Train] acc=93.37% | mean_conf=0.911 | mean_entropy=0.238
+[Train] pred_hist: 0: 163 (27.7%) | 1: 152 (25.9%) | 2: 121 (20.6%) | 3: 152 (25.9%)
+[Train] per-class acc: 0: 97.9% | 1: 97.9% | 2: 77.9% | 3: 100.0%
+2025-10-02 02:59:26,209 | INFO | [Val] acc=78.41% | mean_conf=0.909 | mean_entropy=0.229
+[Val] pred_hist: 0: 16 (18.2%) | 1: 5 (5.7%) | 2: 34 (38.6%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 27.3% | 2: 77.4% | 3: 100.0%
+2025-10-02 02:59:26,210 | INFO | Validation Loss: 0.7187 | CE: 0.7939 | Focal: 0.6434 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 03:01:23,917 | INFO | 
+--- Epoch 100 finished: Avg Loss: 0.1584, Avg Acc: 89.63% ---
+2025-10-02 03:01:23,917 | INFO | [Train] acc=89.63% | mean_conf=0.907 | mean_entropy=0.247
+[Train] pred_hist: 0: 172 (29.3%) | 1: 152 (25.9%) | 2: 120 (20.4%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 93.2% | 1: 97.9% | 2: 69.5% | 3: 99.3%
+2025-10-02 03:01:34,154 | INFO | [Val] acc=75.00% | mean_conf=0.886 | mean_entropy=0.281
+[Val] pred_hist: 0: 27 (30.7%) | 1: 10 (11.4%) | 2: 18 (20.5%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 48.4% | 3: 100.0%
+2025-10-02 03:01:34,154 | INFO | Validation Loss: 0.6378 | CE: 0.7588 | Focal: 0.5168 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 03:03:32,492 | INFO | 
+--- Epoch 101 finished: Avg Loss: 0.1539, Avg Acc: 90.14% ---
+2025-10-02 03:03:32,492 | INFO | [Train] acc=90.14% | mean_conf=0.880 | mean_entropy=0.298
+[Train] pred_hist: 0: 183 (31.1%) | 1: 148 (25.2%) | 2: 118 (20.1%) | 3: 139 (23.6%)
+[Train] per-class acc: 0: 97.3% | 1: 97.2% | 2: 69.2% | 3: 99.3%
+2025-10-02 03:03:42,478 | INFO | [Val] acc=75.00% | mean_conf=0.885 | mean_entropy=0.284
+[Val] pred_hist: 0: 17 (19.3%) | 1: 17 (19.3%) | 2: 21 (23.9%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 72.7% | 2: 51.6% | 3: 100.0%
+2025-10-02 03:03:42,478 | INFO | Validation Loss: 0.5620 | CE: 0.6720 | Focal: 0.4521 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 03:06:03,717 | INFO | 
+--- Epoch 102 finished: Avg Loss: 0.1037, Avg Acc: 94.90% ---
+2025-10-02 03:06:03,718 | INFO | [Train] acc=94.90% | mean_conf=0.923 | mean_entropy=0.212
+[Train] pred_hist: 0: 176 (29.9%) | 1: 133 (22.6%) | 2: 119 (20.2%) | 3: 160 (27.2%)
+[Train] per-class acc: 0: 98.1% | 1: 100.0% | 2: 81.1% | 3: 100.0%
+2025-10-02 03:06:13,779 | INFO | [Val] acc=76.14% | mean_conf=0.911 | mean_entropy=0.242
+[Val] pred_hist: 0: 18 (20.5%) | 1: 12 (13.6%) | 2: 25 (28.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 54.5% | 2: 61.3% | 3: 100.0%
+2025-10-02 03:06:13,779 | INFO | Validation Loss: 0.5579 | CE: 0.6427 | Focal: 0.4731 | Acc: 76.14% | LR: 1.00e-04
+2025-10-02 03:08:19,366 | INFO | 
+--- Epoch 103 finished: Avg Loss: 0.1453, Avg Acc: 91.33% ---
+2025-10-02 03:08:19,366 | INFO | [Train] acc=91.33% | mean_conf=0.912 | mean_entropy=0.245
+[Train] pred_hist: 0: 195 (33.2%) | 1: 138 (23.5%) | 2: 116 (19.7%) | 3: 139 (23.6%)
+[Train] per-class acc: 0: 95.4% | 1: 98.5% | 2: 72.9% | 3: 98.6%
+2025-10-02 03:08:29,721 | INFO | [Val] acc=79.55% | mean_conf=0.877 | mean_entropy=0.286
+[Val] pred_hist: 0: 15 (17.0%) | 1: 12 (13.6%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 63.6% | 2: 71.0% | 3: 100.0%
+2025-10-02 03:08:29,721 | INFO | Validation Loss: 0.5842 | CE: 0.6762 | Focal: 0.4923 | Acc: 79.55% | LR: 1.00e-04
+2025-10-02 03:10:35,646 | INFO | 
+--- Epoch 104 finished: Avg Loss: 0.1886, Avg Acc: 88.27% ---
+2025-10-02 03:10:35,647 | INFO | [Train] acc=88.27% | mean_conf=0.896 | mean_entropy=0.265
+[Train] pred_hist: 0: 166 (28.2%) | 1: 153 (26.0%) | 2: 122 (20.7%) | 3: 147 (25.0%)
+[Train] per-class acc: 0: 92.5% | 1: 96.6% | 2: 67.3% | 3: 99.3%
+2025-10-02 03:10:45,754 | INFO | [Val] acc=81.82% | mean_conf=0.841 | mean_entropy=0.353
+[Val] pred_hist: 0: 15 (17.0%) | 1: 14 (15.9%) | 2: 27 (30.7%) | 3: 32 (36.4%)
+[Val] per-class acc: 0: 69.2% | 1: 81.8% | 2: 71.0% | 3: 97.0%
+2025-10-02 03:10:45,754 | INFO | Validation Loss: 0.4627 | CE: 0.5664 | Focal: 0.3589 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 03:12:51,242 | INFO | 
+--- Epoch 105 finished: Avg Loss: 0.1126, Avg Acc: 93.20% ---
+2025-10-02 03:12:51,243 | INFO | [Train] acc=93.20% | mean_conf=0.900 | mean_entropy=0.255
+[Train] pred_hist: 0: 149 (25.3%) | 1: 153 (26.0%) | 2: 129 (21.9%) | 3: 157 (26.7%)
+[Train] per-class acc: 0: 97.7% | 1: 97.9% | 2: 78.5% | 3: 100.0%
+2025-10-02 03:13:01,666 | INFO | [Val] acc=80.68% | mean_conf=0.911 | mean_entropy=0.229
+[Val] pred_hist: 0: 14 (15.9%) | 1: 9 (10.2%) | 2: 32 (36.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 54.5% | 2: 77.4% | 3: 100.0%
+2025-10-02 03:13:01,666 | INFO | Validation Loss: 0.5939 | CE: 0.6767 | Focal: 0.5112 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 03:15:12,523 | INFO | 
+--- Epoch 106 finished: Avg Loss: 0.0969, Avg Acc: 93.54% ---
+2025-10-02 03:15:12,524 | INFO | [Train] acc=93.54% | mean_conf=0.926 | mean_entropy=0.204
+[Train] pred_hist: 0: 150 (25.5%) | 1: 148 (25.2%) | 2: 144 (24.5%) | 3: 146 (24.8%)
+[Train] per-class acc: 0: 95.0% | 1: 98.6% | 2: 82.8% | 3: 99.3%
+2025-10-02 03:15:23,233 | INFO | [Val] acc=82.95% | mean_conf=0.886 | mean_entropy=0.261
+[Val] pred_hist: 0: 12 (13.6%) | 1: 9 (10.2%) | 2: 34 (38.6%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 54.5% | 2: 83.9% | 3: 100.0%
+2025-10-02 03:15:23,233 | INFO | Validation Loss: 0.5246 | CE: 0.5999 | Focal: 0.4493 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 03:17:33,398 | INFO | 
+--- Epoch 107 finished: Avg Loss: 0.1225, Avg Acc: 93.20% ---
+2025-10-02 03:17:33,398 | INFO | [Train] acc=93.20% | mean_conf=0.933 | mean_entropy=0.198
+[Train] pred_hist: 0: 183 (31.1%) | 1: 146 (24.8%) | 2: 106 (18.0%) | 3: 153 (26.0%)
+[Train] per-class acc: 0: 97.5% | 1: 98.6% | 2: 75.2% | 3: 99.3%
+2025-10-02 03:17:43,913 | INFO | [Val] acc=82.95% | mean_conf=0.913 | mean_entropy=0.220
+[Val] pred_hist: 0: 13 (14.8%) | 1: 12 (13.6%) | 2: 30 (34.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 72.7% | 2: 77.4% | 3: 100.0%
+2025-10-02 03:17:43,913 | INFO | Validation Loss: 0.5406 | CE: 0.6180 | Focal: 0.4633 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 03:19:54,620 | INFO | 
+--- Epoch 108 finished: Avg Loss: 0.1912, Avg Acc: 89.63% ---
+2025-10-02 03:19:54,620 | INFO | [Train] acc=89.63% | mean_conf=0.888 | mean_entropy=0.282
+[Train] pred_hist: 0: 164 (27.9%) | 1: 166 (28.2%) | 2: 109 (18.5%) | 3: 149 (25.3%)
+[Train] per-class acc: 0: 89.0% | 1: 97.5% | 2: 69.9% | 3: 100.0%
+2025-10-02 03:20:05,226 | INFO | [Val] acc=73.86% | mean_conf=0.862 | mean_entropy=0.340
+[Val] pred_hist: 0: 27 (30.7%) | 1: 12 (13.6%) | 2: 16 (18.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 54.5% | 2: 45.2% | 3: 100.0%
+2025-10-02 03:20:05,226 | INFO | Validation Loss: 0.5929 | CE: 0.7098 | Focal: 0.4761 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 03:22:15,066 | INFO | 
+--- Epoch 109 finished: Avg Loss: 0.1094, Avg Acc: 94.05% ---
+2025-10-02 03:22:15,067 | INFO | [Train] acc=94.05% | mean_conf=0.911 | mean_entropy=0.238
+[Train] pred_hist: 0: 160 (27.2%) | 1: 159 (27.0%) | 2: 117 (19.9%) | 3: 152 (25.9%)
+[Train] per-class acc: 0: 98.5% | 1: 99.4% | 2: 79.0% | 3: 98.7%
+2025-10-02 03:22:25,739 | INFO | [Val] acc=80.68% | mean_conf=0.922 | mean_entropy=0.218
+[Val] pred_hist: 0: 21 (23.9%) | 1: 15 (17.0%) | 2: 19 (21.6%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 81.8% | 2: 54.8% | 3: 100.0%
+2025-10-02 03:22:25,739 | INFO | Validation Loss: 0.5342 | CE: 0.6397 | Focal: 0.4287 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 03:24:36,518 | INFO | 
+--- Epoch 110 finished: Avg Loss: 0.1789, Avg Acc: 89.63% ---
+2025-10-02 03:24:36,519 | INFO | [Train] acc=89.63% | mean_conf=0.911 | mean_entropy=0.244
+[Train] pred_hist: 0: 174 (29.6%) | 1: 172 (29.3%) | 2: 108 (18.4%) | 3: 134 (22.8%)
+[Train] per-class acc: 0: 94.2% | 1: 94.9% | 2: 69.7% | 3: 99.3%
+2025-10-02 03:24:47,446 | INFO | [Val] acc=81.82% | mean_conf=0.864 | mean_entropy=0.329
+[Val] pred_hist: 0: 16 (18.2%) | 1: 7 (8.0%) | 2: 32 (36.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 45.5% | 2: 80.6% | 3: 100.0%
+2025-10-02 03:24:47,446 | INFO | Validation Loss: 0.5015 | CE: 0.5990 | Focal: 0.4041 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 03:26:57,104 | INFO | 
+--- Epoch 111 finished: Avg Loss: 0.1114, Avg Acc: 94.22% ---
+2025-10-02 03:26:57,104 | INFO | [Train] acc=94.22% | mean_conf=0.905 | mean_entropy=0.256
+[Train] pred_hist: 0: 143 (24.3%) | 1: 157 (26.7%) | 2: 149 (25.3%) | 3: 139 (23.6%)
+[Train] per-class acc: 0: 96.1% | 1: 98.7% | 2: 84.0% | 3: 100.0%
+2025-10-02 03:27:07,971 | INFO | [Val] acc=73.86% | mean_conf=0.899 | mean_entropy=0.254
+[Val] pred_hist: 0: 20 (22.7%) | 1: 16 (18.2%) | 2: 19 (21.6%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 54.5% | 2: 51.6% | 3: 100.0%
+2025-10-02 03:27:07,971 | INFO | Validation Loss: 0.5091 | CE: 0.6242 | Focal: 0.3941 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 03:29:17,375 | INFO | 
+--- Epoch 112 finished: Avg Loss: 0.0846, Avg Acc: 95.07% ---
+2025-10-02 03:29:17,375 | INFO | [Train] acc=95.07% | mean_conf=0.925 | mean_entropy=0.202
+[Train] pred_hist: 0: 173 (29.4%) | 1: 138 (23.5%) | 2: 130 (22.1%) | 3: 147 (25.0%)
+[Train] per-class acc: 0: 98.7% | 1: 99.3% | 2: 83.0% | 3: 100.0%
+2025-10-02 03:29:28,101 | INFO | [Val] acc=86.36% | mean_conf=0.939 | mean_entropy=0.168
+[Val] pred_hist: 0: 15 (17.0%) | 1: 11 (12.5%) | 2: 29 (33.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 80.6% | 3: 100.0%
+2025-10-02 03:29:28,101 | INFO | Validation Loss: 0.4485 | CE: 0.5030 | Focal: 0.3939 | Acc: 86.36% | LR: 1.00e-04
+2025-10-02 03:29:28,115 | INFO | \u2705 New best model saved: Medium_v3.3_86.36.pth
+2025-10-02 03:31:37,197 | INFO | 
+--- Epoch 113 finished: Avg Loss: 0.1282, Avg Acc: 94.05% ---
+2025-10-02 03:31:37,198 | INFO | [Train] acc=94.05% | mean_conf=0.927 | mean_entropy=0.202
+[Train] pred_hist: 0: 157 (26.7%) | 1: 155 (26.4%) | 2: 139 (23.6%) | 3: 137 (23.3%)
+[Train] per-class acc: 0: 97.8% | 1: 98.6% | 2: 82.3% | 3: 99.3%
+2025-10-02 03:31:47,895 | INFO | [Val] acc=76.14% | mean_conf=0.900 | mean_entropy=0.252
+[Val] pred_hist: 0: 18 (20.5%) | 1: 22 (25.0%) | 2: 15 (17.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 100.0% | 2: 45.2% | 3: 100.0%
+2025-10-02 03:31:47,895 | INFO | Validation Loss: 0.4736 | CE: 0.6005 | Focal: 0.3467 | Acc: 76.14% | LR: 1.00e-04
+2025-10-02 03:33:59,383 | INFO | 
+--- Epoch 114 finished: Avg Loss: 0.1560, Avg Acc: 92.69% ---
+2025-10-02 03:33:59,383 | INFO | [Train] acc=92.69% | mean_conf=0.907 | mean_entropy=0.247
+[Train] pred_hist: 0: 183 (31.1%) | 1: 148 (25.2%) | 2: 109 (18.5%) | 3: 148 (25.2%)
+[Train] per-class acc: 0: 95.7% | 1: 97.8% | 2: 75.9% | 3: 100.0%
+2025-10-02 03:34:10,253 | INFO | [Val] acc=82.95% | mean_conf=0.935 | mean_entropy=0.177
+[Val] pred_hist: 0: 22 (25.0%) | 1: 10 (11.4%) | 2: 23 (26.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 63.6% | 2: 67.7% | 3: 100.0%
+2025-10-02 03:34:10,253 | INFO | Validation Loss: 0.5950 | CE: 0.6865 | Focal: 0.5035 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 03:36:19,928 | INFO | 
+--- Epoch 115 finished: Avg Loss: 0.1257, Avg Acc: 92.69% ---
+2025-10-02 03:36:19,928 | INFO | [Train] acc=92.69% | mean_conf=0.923 | mean_entropy=0.209
+[Train] pred_hist: 0: 174 (29.6%) | 1: 138 (23.5%) | 2: 127 (21.6%) | 3: 149 (25.3%)
+[Train] per-class acc: 0: 96.1% | 1: 97.7% | 2: 77.8% | 3: 100.0%
+2025-10-02 03:36:30,706 | INFO | [Val] acc=80.68% | mean_conf=0.908 | mean_entropy=0.228
+[Val] pred_hist: 0: 17 (19.3%) | 1: 9 (10.2%) | 2: 29 (33.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 54.5% | 2: 74.2% | 3: 100.0%
+2025-10-02 03:36:30,706 | INFO | Validation Loss: 0.6311 | CE: 0.7155 | Focal: 0.5466 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 03:38:40,194 | INFO | 
+--- Epoch 116 finished: Avg Loss: 0.0891, Avg Acc: 94.56% ---
+2025-10-02 03:38:40,195 | INFO | [Train] acc=94.56% | mean_conf=0.931 | mean_entropy=0.193
+[Train] pred_hist: 0: 168 (28.6%) | 1: 157 (26.7%) | 2: 116 (19.7%) | 3: 147 (25.0%)
+[Train] per-class acc: 0: 98.7% | 1: 98.7% | 2: 80.0% | 3: 100.0%
+2025-10-02 03:38:51,311 | INFO | [Val] acc=82.95% | mean_conf=0.948 | mean_entropy=0.154
+[Val] pred_hist: 0: 14 (15.9%) | 1: 16 (18.2%) | 2: 25 (28.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 81.8% | 2: 71.0% | 3: 100.0%
+2025-10-02 03:38:51,311 | INFO | Validation Loss: 0.5767 | CE: 0.6407 | Focal: 0.5126 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 03:41:00,650 | INFO | 
+--- Epoch 117 finished: Avg Loss: 0.1332, Avg Acc: 93.71% ---
+2025-10-02 03:41:00,651 | INFO | [Train] acc=93.71% | mean_conf=0.936 | mean_entropy=0.181
+[Train] pred_hist: 0: 157 (26.7%) | 1: 142 (24.1%) | 2: 128 (21.8%) | 3: 161 (27.4%)
+[Train] per-class acc: 0: 95.7% | 1: 98.5% | 2: 81.0% | 3: 100.0%
+2025-10-02 03:41:12,116 | INFO | [Val] acc=81.82% | mean_conf=0.910 | mean_entropy=0.235
+[Val] pred_hist: 0: 17 (19.3%) | 1: 16 (18.2%) | 2: 22 (25.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 90.9% | 2: 64.5% | 3: 100.0%
+2025-10-02 03:41:12,116 | INFO | Validation Loss: 0.5782 | CE: 0.6669 | Focal: 0.4896 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 03:43:21,702 | INFO | 
+--- Epoch 118 finished: Avg Loss: 0.0968, Avg Acc: 94.73% ---
+2025-10-02 03:43:21,703 | INFO | [Train] acc=94.73% | mean_conf=0.927 | mean_entropy=0.207
+[Train] pred_hist: 0: 173 (29.4%) | 1: 143 (24.3%) | 2: 135 (23.0%) | 3: 137 (23.3%)
+[Train] per-class acc: 0: 98.7% | 1: 98.6% | 2: 84.1% | 3: 98.6%
+2025-10-02 03:43:32,409 | INFO | [Val] acc=75.00% | mean_conf=0.905 | mean_entropy=0.226
+[Val] pred_hist: 0: 8 (9.1%) | 1: 13 (14.8%) | 2: 35 (39.8%) | 3: 32 (36.4%)
+[Val] per-class acc: 0: 38.5% | 1: 54.5% | 2: 74.2% | 3: 97.0%
+2025-10-02 03:43:32,409 | INFO | Validation Loss: 0.8768 | CE: 0.9688 | Focal: 0.7849 | Acc: 75.00% | LR: 1.00e-04
+2025-10-02 03:45:44,147 | INFO | 
+--- Epoch 119 finished: Avg Loss: 0.1638, Avg Acc: 93.03% ---
+2025-10-02 03:45:44,148 | INFO | [Train] acc=93.03% | mean_conf=0.930 | mean_entropy=0.201
+[Train] pred_hist: 0: 160 (27.2%) | 1: 168 (28.6%) | 2: 133 (22.6%) | 3: 127 (21.6%)
+[Train] per-class acc: 0: 95.3% | 1: 97.5% | 2: 82.1% | 3: 97.7%
+2025-10-02 03:45:54,896 | INFO | [Val] acc=73.86% | mean_conf=0.894 | mean_entropy=0.262
+[Val] pred_hist: 0: 22 (25.0%) | 1: 18 (20.5%) | 2: 15 (17.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 72.7% | 2: 41.9% | 3: 100.0%
+2025-10-02 03:45:54,896 | INFO | Validation Loss: 0.5921 | CE: 0.7112 | Focal: 0.4730 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 03:48:05,368 | INFO | 
+--- Epoch 120 finished: Avg Loss: 0.0785, Avg Acc: 96.09% ---
+2025-10-02 03:48:05,368 | INFO | [Train] acc=96.09% | mean_conf=0.934 | mean_entropy=0.199
+[Train] pred_hist: 0: 167 (28.4%) | 1: 146 (24.8%) | 2: 149 (25.3%) | 3: 126 (21.4%)
+[Train] per-class acc: 0: 100.0% | 1: 98.6% | 2: 88.0% | 3: 99.2%
+2025-10-02 03:48:16,102 | INFO | [Val] acc=80.68% | mean_conf=0.945 | mean_entropy=0.157
+[Val] pred_hist: 0: 9 (10.2%) | 1: 10 (11.4%) | 2: 36 (40.9%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 46.2% | 1: 54.5% | 2: 83.9% | 3: 100.0%
+2025-10-02 03:48:16,102 | INFO | Validation Loss: 0.8449 | CE: 0.8932 | Focal: 0.7966 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 03:50:28,896 | INFO | 
+--- Epoch 121 finished: Avg Loss: 0.1213, Avg Acc: 92.69% ---
+2025-10-02 03:50:28,897 | INFO | [Train] acc=92.69% | mean_conf=0.930 | mean_entropy=0.197
+[Train] pred_hist: 0: 155 (26.4%) | 1: 158 (26.9%) | 2: 122 (20.7%) | 3: 153 (26.0%)
+[Train] per-class acc: 0: 97.1% | 1: 98.6% | 2: 76.3% | 3: 99.4%
+2025-10-02 03:50:39,639 | INFO | [Val] acc=80.68% | mean_conf=0.915 | mean_entropy=0.201
+[Val] pred_hist: 0: 8 (9.1%) | 1: 15 (17.0%) | 2: 32 (36.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 38.5% | 1: 81.8% | 2: 77.4% | 3: 100.0%
+2025-10-02 03:50:39,639 | INFO | Validation Loss: 0.6290 | CE: 0.6993 | Focal: 0.5587 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 03:52:49,447 | INFO | 
+--- Epoch 122 finished: Avg Loss: 0.0714, Avg Acc: 96.43% ---
+2025-10-02 03:52:49,447 | INFO | [Train] acc=96.43% | mean_conf=0.943 | mean_entropy=0.165
+[Train] pred_hist: 0: 169 (28.7%) | 1: 146 (24.8%) | 2: 129 (21.9%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 98.1% | 1: 99.3% | 2: 88.0% | 3: 100.0%
+2025-10-02 03:53:00,186 | INFO | [Val] acc=81.82% | mean_conf=0.946 | mean_entropy=0.149
+[Val] pred_hist: 0: 14 (15.9%) | 1: 13 (14.8%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 72.7% | 2: 74.2% | 3: 100.0%
+2025-10-02 03:53:00,186 | INFO | Validation Loss: 0.7850 | CE: 0.8465 | Focal: 0.7235 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 03:55:10,842 | INFO | 
+--- Epoch 123 finished: Avg Loss: 0.0697, Avg Acc: 95.92% ---
+2025-10-02 03:55:10,843 | INFO | [Train] acc=95.92% | mean_conf=0.947 | mean_entropy=0.150
+[Train] pred_hist: 0: 151 (25.7%) | 1: 157 (26.7%) | 2: 138 (23.5%) | 3: 142 (24.1%)
+[Train] per-class acc: 0: 97.2% | 1: 99.3% | 2: 88.7% | 3: 98.6%
+2025-10-02 03:55:21,572 | INFO | [Val] acc=76.14% | mean_conf=0.941 | mean_entropy=0.147
+[Val] pred_hist: 0: 7 (8.0%) | 1: 7 (8.0%) | 2: 40 (45.5%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 30.8% | 1: 36.4% | 2: 83.9% | 3: 100.0%
+2025-10-02 03:55:21,572 | INFO | Validation Loss: 1.0998 | CE: 1.1524 | Focal: 1.0472 | Acc: 76.14% | LR: 1.00e-04
+2025-10-02 03:57:37,232 | INFO | 
+--- Epoch 124 finished: Avg Loss: 0.1008, Avg Acc: 93.88% ---
+2025-10-02 03:57:37,233 | INFO | [Train] acc=93.88% | mean_conf=0.945 | mean_entropy=0.154
+[Train] pred_hist: 0: 141 (24.0%) | 1: 161 (27.4%) | 2: 132 (22.4%) | 3: 154 (26.2%)
+[Train] per-class acc: 0: 96.2% | 1: 96.7% | 2: 82.7% | 3: 100.0%
+2025-10-02 03:57:47,870 | INFO | [Val] acc=84.09% | mean_conf=0.940 | mean_entropy=0.160
+[Val] pred_hist: 0: 12 (13.6%) | 1: 11 (12.5%) | 2: 32 (36.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 63.6% | 2: 80.6% | 3: 100.0%
+2025-10-02 03:57:47,870 | INFO | Validation Loss: 0.6226 | CE: 0.6766 | Focal: 0.5687 | Acc: 84.09% | LR: 1.00e-04
+2025-10-02 03:59:48,734 | INFO | 
+--- Epoch 125 finished: Avg Loss: 0.0931, Avg Acc: 94.39% ---
+2025-10-02 03:59:48,735 | INFO | [Train] acc=94.39% | mean_conf=0.941 | mean_entropy=0.168
+[Train] pred_hist: 0: 160 (27.2%) | 1: 150 (25.5%) | 2: 138 (23.5%) | 3: 140 (23.8%)
+[Train] per-class acc: 0: 97.3% | 1: 97.2% | 2: 84.4% | 3: 99.3%
+2025-10-02 03:59:58,990 | INFO | [Val] acc=81.82% | mean_conf=0.922 | mean_entropy=0.201
+[Val] pred_hist: 0: 14 (15.9%) | 1: 16 (18.2%) | 2: 25 (28.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 81.8% | 2: 67.7% | 3: 100.0%
+2025-10-02 03:59:58,990 | INFO | Validation Loss: 0.6879 | CE: 0.7806 | Focal: 0.5952 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 04:01:54,409 | INFO | 
+--- Epoch 126 finished: Avg Loss: 0.0489, Avg Acc: 97.28% ---
+2025-10-02 04:01:54,409 | INFO | [Train] acc=97.28% | mean_conf=0.958 | mean_entropy=0.134
+[Train] pred_hist: 0: 165 (28.1%) | 1: 151 (25.7%) | 2: 135 (23.0%) | 3: 137 (23.3%)
+[Train] per-class acc: 0: 98.7% | 1: 100.0% | 2: 90.5% | 3: 100.0%
+2025-10-02 04:02:06,538 | INFO | [Val] acc=84.09% | mean_conf=0.939 | mean_entropy=0.164
+[Val] pred_hist: 0: 12 (13.6%) | 1: 11 (12.5%) | 2: 32 (36.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 72.7% | 2: 80.6% | 3: 100.0%
+2025-10-02 04:02:06,539 | INFO | Validation Loss: 0.6357 | CE: 0.6952 | Focal: 0.5762 | Acc: 84.09% | LR: 1.00e-04
+2025-10-02 04:04:13,152 | INFO | 
+--- Epoch 127 finished: Avg Loss: 0.2294, Avg Acc: 90.82% ---
+2025-10-02 04:04:13,153 | INFO | [Train] acc=90.82% | mean_conf=0.917 | mean_entropy=0.223
+[Train] pred_hist: 0: 160 (27.2%) | 1: 156 (26.5%) | 2: 126 (21.4%) | 3: 146 (24.8%)
+[Train] per-class acc: 0: 93.0% | 1: 94.6% | 2: 77.5% | 3: 98.6%
+2025-10-02 04:04:23,915 | INFO | [Val] acc=77.27% | mean_conf=0.864 | mean_entropy=0.331
+[Val] pred_hist: 0: 12 (13.6%) | 1: 12 (13.6%) | 2: 30 (34.1%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 38.5% | 1: 63.6% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:04:23,915 | INFO | Validation Loss: 0.5561 | CE: 0.6563 | Focal: 0.4559 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 04:06:20,880 | INFO | 
+--- Epoch 128 finished: Avg Loss: 0.1089, Avg Acc: 93.88% ---
+2025-10-02 04:06:20,880 | INFO | [Train] acc=93.88% | mean_conf=0.921 | mean_entropy=0.219
+[Train] pred_hist: 0: 155 (26.4%) | 1: 128 (21.8%) | 2: 122 (20.7%) | 3: 183 (31.1%)
+[Train] per-class acc: 0: 95.7% | 1: 99.2% | 2: 79.9% | 3: 100.0%
+2025-10-02 04:06:31,710 | INFO | [Val] acc=73.86% | mean_conf=0.901 | mean_entropy=0.265
+[Val] pred_hist: 0: 24 (27.3%) | 1: 15 (17.0%) | 2: 16 (18.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 45.2% | 3: 100.0%
+2025-10-02 04:06:31,710 | INFO | Validation Loss: 0.5928 | CE: 0.7032 | Focal: 0.4823 | Acc: 73.86% | LR: 1.00e-04
+2025-10-02 04:08:27,712 | INFO | 
+--- Epoch 129 finished: Avg Loss: 0.0876, Avg Acc: 95.07% ---
+2025-10-02 04:08:27,713 | INFO | [Train] acc=95.07% | mean_conf=0.935 | mean_entropy=0.179
+[Train] pred_hist: 0: 140 (23.8%) | 1: 162 (27.6%) | 2: 133 (22.6%) | 3: 153 (26.0%)
+[Train] per-class acc: 0: 98.4% | 1: 98.1% | 2: 84.2% | 3: 100.0%
+2025-10-02 04:08:38,393 | INFO | [Val] acc=78.41% | mean_conf=0.935 | mean_entropy=0.155
+[Val] pred_hist: 0: 7 (8.0%) | 1: 9 (10.2%) | 2: 39 (44.3%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 30.8% | 1: 45.5% | 2: 87.1% | 3: 100.0%
+2025-10-02 04:08:38,393 | INFO | Validation Loss: 1.0485 | CE: 1.1041 | Focal: 0.9928 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 04:10:36,400 | INFO | 
+--- Epoch 130 finished: Avg Loss: 0.0572, Avg Acc: 97.28% ---
+2025-10-02 04:10:36,400 | INFO | [Train] acc=97.28% | mean_conf=0.959 | mean_entropy=0.127
+[Train] pred_hist: 0: 138 (23.5%) | 1: 147 (25.0%) | 2: 140 (23.8%) | 3: 163 (27.7%)
+[Train] per-class acc: 0: 99.2% | 1: 99.3% | 2: 91.3% | 3: 99.4%
+2025-10-02 04:10:46,918 | INFO | [Val] acc=82.95% | mean_conf=0.914 | mean_entropy=0.210
+[Val] pred_hist: 0: 14 (15.9%) | 1: 12 (13.6%) | 2: 29 (33.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 63.6% | 2: 77.4% | 3: 100.0%
+2025-10-02 04:10:46,918 | INFO | Validation Loss: 0.6232 | CE: 0.6913 | Focal: 0.5551 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 04:12:43,442 | INFO | 
+--- Epoch 131 finished: Avg Loss: 0.0896, Avg Acc: 94.05% ---
+2025-10-02 04:12:43,443 | INFO | [Train] acc=94.05% | mean_conf=0.942 | mean_entropy=0.165
+[Train] pred_hist: 0: 183 (31.1%) | 1: 143 (24.3%) | 2: 133 (22.6%) | 3: 129 (21.9%)
+[Train] per-class acc: 0: 97.0% | 1: 98.6% | 2: 84.0% | 3: 97.0%
+2025-10-02 04:12:54,175 | INFO | [Val] acc=82.95% | mean_conf=0.945 | mean_entropy=0.159
+[Val] pred_hist: 0: 16 (18.2%) | 1: 8 (9.1%) | 2: 30 (34.1%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 76.9% | 1: 45.5% | 2: 80.6% | 3: 100.0%
+2025-10-02 04:12:54,175 | INFO | Validation Loss: 0.7903 | CE: 0.8701 | Focal: 0.7104 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 04:14:51,181 | INFO | 
+--- Epoch 132 finished: Avg Loss: 0.0908, Avg Acc: 95.75% ---
+2025-10-02 04:14:51,181 | INFO | [Train] acc=95.75% | mean_conf=0.938 | mean_entropy=0.178
+[Train] pred_hist: 0: 151 (25.7%) | 1: 146 (24.8%) | 2: 140 (23.8%) | 3: 151 (25.7%)
+[Train] per-class acc: 0: 97.8% | 1: 97.9% | 2: 88.5% | 3: 99.3%
+2025-10-02 04:15:01,868 | INFO | [Val] acc=77.27% | mean_conf=0.947 | mean_entropy=0.150
+[Val] pred_hist: 0: 19 (21.6%) | 1: 7 (8.0%) | 2: 29 (33.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 36.4% | 2: 71.0% | 3: 100.0%
+2025-10-02 04:15:01,868 | INFO | Validation Loss: 0.8043 | CE: 0.8683 | Focal: 0.7403 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 04:16:57,678 | INFO | 
+--- Epoch 133 finished: Avg Loss: 0.0585, Avg Acc: 96.09% ---
+2025-10-02 04:16:57,678 | INFO | [Train] acc=96.09% | mean_conf=0.951 | mean_entropy=0.136
+[Train] pred_hist: 0: 170 (28.9%) | 1: 155 (26.4%) | 2: 125 (21.3%) | 3: 138 (23.5%)
+[Train] per-class acc: 0: 98.1% | 1: 99.3% | 2: 86.4% | 3: 100.0%
+2025-10-02 04:17:08,254 | INFO | [Val] acc=77.27% | mean_conf=0.941 | mean_entropy=0.129
+[Val] pred_hist: 0: 5 (5.7%) | 1: 7 (8.0%) | 2: 43 (48.9%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 23.1% | 1: 36.4% | 2: 90.3% | 3: 100.0%
+2025-10-02 04:17:08,254 | INFO | Validation Loss: 1.1711 | CE: 1.2209 | Focal: 1.1212 | Acc: 77.27% | LR: 1.00e-04
+2025-10-02 04:19:03,382 | INFO | 
+--- Epoch 134 finished: Avg Loss: 0.1171, Avg Acc: 94.39% ---
+2025-10-02 04:19:03,383 | INFO | [Train] acc=94.39% | mean_conf=0.941 | mean_entropy=0.161
+[Train] pred_hist: 0: 158 (26.9%) | 1: 160 (27.2%) | 2: 115 (19.6%) | 3: 155 (26.4%)
+[Train] per-class acc: 0: 96.6% | 1: 98.1% | 2: 81.1% | 3: 100.0%
+2025-10-02 04:19:13,629 | INFO | [Val] acc=82.95% | mean_conf=0.921 | mean_entropy=0.190
+[Val] pred_hist: 0: 18 (20.5%) | 1: 10 (11.4%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 54.5% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:19:13,629 | INFO | Validation Loss: 0.6232 | CE: 0.6999 | Focal: 0.5466 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 04:21:28,310 | INFO | 
+--- Epoch 135 finished: Avg Loss: 0.0438, Avg Acc: 97.45% ---
+2025-10-02 04:21:28,311 | INFO | [Train] acc=97.45% | mean_conf=0.958 | mean_entropy=0.118
+[Train] pred_hist: 0: 156 (26.5%) | 1: 161 (27.4%) | 2: 114 (19.4%) | 3: 157 (26.7%)
+[Train] per-class acc: 0: 99.3% | 1: 100.0% | 2: 89.0% | 3: 100.0%
+2025-10-02 04:21:42,864 | INFO | [Val] acc=80.68% | mean_conf=0.954 | mean_entropy=0.134
+[Val] pred_hist: 0: 18 (20.5%) | 1: 13 (14.8%) | 2: 24 (27.3%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 64.5% | 3: 100.0%
+2025-10-02 04:21:42,864 | INFO | Validation Loss: 0.6740 | CE: 0.7505 | Focal: 0.5976 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 04:24:07,883 | INFO | 
+--- Epoch 136 finished: Avg Loss: 0.0599, Avg Acc: 97.11% ---
+2025-10-02 04:24:07,883 | INFO | [Train] acc=97.11% | mean_conf=0.964 | mean_entropy=0.106
+[Train] pred_hist: 0: 145 (24.7%) | 1: 164 (27.9%) | 2: 127 (21.6%) | 3: 152 (25.9%)
+[Train] per-class acc: 0: 98.5% | 1: 100.0% | 2: 89.3% | 3: 100.0%
+2025-10-02 04:24:19,954 | INFO | [Val] acc=82.95% | mean_conf=0.934 | mean_entropy=0.158
+[Val] pred_hist: 0: 12 (13.6%) | 1: 12 (13.6%) | 2: 31 (35.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 72.7% | 2: 80.6% | 3: 100.0%
+2025-10-02 04:24:19,955 | INFO | Validation Loss: 0.6448 | CE: 0.7034 | Focal: 0.5861 | Acc: 82.95% | LR: 1.00e-04
+2025-10-02 04:26:49,847 | INFO | 
+--- Epoch 137 finished: Avg Loss: 0.0483, Avg Acc: 97.45% ---
+2025-10-02 04:26:49,848 | INFO | [Train] acc=97.45% | mean_conf=0.964 | mean_entropy=0.107
+[Train] pred_hist: 0: 171 (29.1%) | 1: 124 (21.1%) | 2: 143 (24.3%) | 3: 150 (25.5%)
+[Train] per-class acc: 0: 98.8% | 1: 99.2% | 2: 92.1% | 3: 100.0%
+2025-10-02 04:27:00,408 | INFO | [Val] acc=85.23% | mean_conf=0.942 | mean_entropy=0.152
+[Val] pred_hist: 0: 15 (17.0%) | 1: 12 (13.6%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 72.7% | 2: 77.4% | 3: 100.0%
+2025-10-02 04:27:00,408 | INFO | Validation Loss: 0.5209 | CE: 0.5779 | Focal: 0.4638 | Acc: 85.23% | LR: 1.00e-04
+2025-10-02 04:29:14,897 | INFO | 
+--- Epoch 138 finished: Avg Loss: 0.1069, Avg Acc: 94.39% ---
+2025-10-02 04:29:14,898 | INFO | [Train] acc=94.39% | mean_conf=0.947 | mean_entropy=0.151
+[Train] pred_hist: 0: 148 (25.2%) | 1: 158 (26.9%) | 2: 141 (24.0%) | 3: 141 (24.0%)
+[Train] per-class acc: 0: 100.0% | 1: 95.9% | 2: 83.9% | 3: 99.3%
+2025-10-02 04:29:25,362 | INFO | [Val] acc=81.82% | mean_conf=0.951 | mean_entropy=0.136
+[Val] pred_hist: 0: 16 (18.2%) | 1: 11 (12.5%) | 2: 28 (31.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 69.2% | 1: 63.6% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:29:25,363 | INFO | Validation Loss: 0.7239 | CE: 0.8016 | Focal: 0.6461 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 04:31:27,579 | INFO | 
+--- Epoch 139 finished: Avg Loss: 0.0628, Avg Acc: 95.75% ---
+2025-10-02 04:31:27,579 | INFO | [Train] acc=95.75% | mean_conf=0.957 | mean_entropy=0.130
+[Train] pred_hist: 0: 159 (27.0%) | 1: 155 (26.4%) | 2: 131 (22.3%) | 3: 143 (24.3%)
+[Train] per-class acc: 0: 97.4% | 1: 98.7% | 2: 88.1% | 3: 98.6%
+2025-10-02 04:31:38,283 | INFO | [Val] acc=84.09% | mean_conf=0.930 | mean_entropy=0.177
+[Val] pred_hist: 0: 17 (19.3%) | 1: 11 (12.5%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:31:38,283 | INFO | Validation Loss: 0.7874 | CE: 0.8546 | Focal: 0.7201 | Acc: 84.09% | LR: 1.00e-04
+2025-10-02 04:33:41,790 | INFO | 
+--- Epoch 140 finished: Avg Loss: 0.0594, Avg Acc: 96.77% ---
+2025-10-02 04:33:41,791 | INFO | [Train] acc=96.77% | mean_conf=0.956 | mean_entropy=0.129
+[Train] pred_hist: 0: 167 (28.4%) | 1: 143 (24.3%) | 2: 134 (22.8%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 98.7% | 1: 100.0% | 2: 88.6% | 3: 100.0%
+2025-10-02 04:33:52,667 | INFO | [Val] acc=79.55% | mean_conf=0.954 | mean_entropy=0.125
+[Val] pred_hist: 0: 15 (17.0%) | 1: 9 (10.2%) | 2: 30 (34.1%) | 3: 34 (38.6%)
+[Val] per-class acc: 0: 61.5% | 1: 45.5% | 2: 77.4% | 3: 100.0%
+2025-10-02 04:33:52,667 | INFO | Validation Loss: 1.0368 | CE: 1.1073 | Focal: 0.9663 | Acc: 79.55% | LR: 1.00e-04
+2025-10-02 04:35:54,628 | INFO | 
+--- Epoch 141 finished: Avg Loss: 0.0564, Avg Acc: 97.28% ---
+2025-10-02 04:35:54,628 | INFO | [Train] acc=97.28% | mean_conf=0.967 | mean_entropy=0.101
+[Train] pred_hist: 0: 150 (25.5%) | 1: 160 (27.2%) | 2: 156 (26.5%) | 3: 122 (20.7%)
+[Train] per-class acc: 0: 99.3% | 1: 99.4% | 2: 91.7% | 3: 100.0%
+2025-10-02 04:36:05,107 | INFO | [Val] acc=80.68% | mean_conf=0.945 | mean_entropy=0.134
+[Val] pred_hist: 0: 20 (22.7%) | 1: 10 (11.4%) | 2: 25 (28.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 54.5% | 2: 67.7% | 3: 100.0%
+2025-10-02 04:36:05,107 | INFO | Validation Loss: 0.7798 | CE: 0.8469 | Focal: 0.7128 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 04:38:08,646 | INFO | 
+--- Epoch 142 finished: Avg Loss: 0.0473, Avg Acc: 96.60% ---
+2025-10-02 04:38:08,646 | INFO | [Train] acc=96.60% | mean_conf=0.962 | mean_entropy=0.110
+[Train] pred_hist: 0: 165 (28.1%) | 1: 166 (28.2%) | 2: 136 (23.1%) | 3: 121 (20.6%)
+[Train] per-class acc: 0: 98.7% | 1: 98.8% | 2: 89.2% | 3: 100.0%
+2025-10-02 04:38:19,605 | INFO | [Val] acc=80.68% | mean_conf=0.948 | mean_entropy=0.123
+[Val] pred_hist: 0: 7 (8.0%) | 1: 11 (12.5%) | 2: 37 (42.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 38.5% | 1: 54.5% | 2: 87.1% | 3: 100.0%
+2025-10-02 04:38:19,605 | INFO | Validation Loss: 1.1615 | CE: 1.2258 | Focal: 1.0973 | Acc: 80.68% | LR: 1.00e-04
+2025-10-02 04:40:18,869 | INFO | 
+--- Epoch 143 finished: Avg Loss: 0.1619, Avg Acc: 91.84% ---
+2025-10-02 04:40:18,870 | INFO | [Train] acc=91.84% | mean_conf=0.922 | mean_entropy=0.206
+[Train] pred_hist: 0: 170 (28.9%) | 1: 179 (30.4%) | 2: 112 (19.0%) | 3: 127 (21.6%)
+[Train] per-class acc: 0: 94.9% | 1: 95.8% | 2: 76.3% | 3: 99.2%
+2025-10-02 04:40:29,408 | INFO | [Val] acc=84.09% | mean_conf=0.927 | mean_entropy=0.186
+[Val] pred_hist: 0: 15 (17.0%) | 1: 13 (14.8%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 72.7% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:40:29,408 | INFO | Validation Loss: 0.6198 | CE: 0.6973 | Focal: 0.5423 | Acc: 84.09% | LR: 1.00e-04
+2025-10-02 04:42:30,917 | INFO | 
+--- Epoch 144 finished: Avg Loss: 0.0665, Avg Acc: 96.77% ---
+2025-10-02 04:42:30,917 | INFO | [Train] acc=96.77% | mean_conf=0.953 | mean_entropy=0.139
+[Train] pred_hist: 0: 144 (24.5%) | 1: 155 (26.4%) | 2: 131 (22.3%) | 3: 158 (26.9%)
+[Train] per-class acc: 0: 99.2% | 1: 99.3% | 2: 88.4% | 3: 100.0%
+2025-10-02 04:42:41,401 | INFO | [Val] acc=78.41% | mean_conf=0.941 | mean_entropy=0.140
+[Val] pred_hist: 0: 15 (17.0%) | 1: 9 (10.2%) | 2: 31 (35.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 45.5% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:42:41,401 | INFO | Validation Loss: 0.9861 | CE: 1.0688 | Focal: 0.9034 | Acc: 78.41% | LR: 1.00e-04
+2025-10-02 04:44:37,404 | INFO | 
+--- Epoch 145 finished: Avg Loss: 0.0833, Avg Acc: 95.24% ---
+2025-10-02 04:44:37,405 | INFO | [Train] acc=95.24% | mean_conf=0.961 | mean_entropy=0.118
+[Train] pred_hist: 0: 163 (27.7%) | 1: 144 (24.5%) | 2: 122 (20.7%) | 3: 159 (27.0%)
+[Train] per-class acc: 0: 97.3% | 1: 98.6% | 2: 85.4% | 3: 98.8%
+2025-10-02 04:44:47,867 | INFO | [Val] acc=85.23% | mean_conf=0.928 | mean_entropy=0.168
+[Val] pred_hist: 0: 9 (10.2%) | 1: 8 (9.1%) | 2: 38 (43.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 63.6% | 2: 90.3% | 3: 100.0%
+2025-10-02 04:44:47,867 | INFO | Validation Loss: 0.6056 | CE: 0.6631 | Focal: 0.5480 | Acc: 85.23% | LR: 1.00e-04
+2025-10-02 04:46:42,350 | INFO | 
+--- Epoch 146 finished: Avg Loss: 0.1688, Avg Acc: 91.50% ---
+2025-10-02 04:46:42,351 | INFO | [Train] acc=91.50% | mean_conf=0.903 | mean_entropy=0.247
+[Train] pred_hist: 0: 191 (32.5%) | 1: 153 (26.0%) | 2: 109 (18.5%) | 3: 135 (23.0%)
+[Train] per-class acc: 0: 97.6% | 1: 95.2% | 2: 72.9% | 3: 99.3%
+2025-10-02 04:46:52,891 | INFO | [Val] acc=85.23% | mean_conf=0.922 | mean_entropy=0.195
+[Val] pred_hist: 0: 14 (15.9%) | 1: 11 (12.5%) | 2: 30 (34.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 63.6% | 2: 80.6% | 3: 100.0%
+2025-10-02 04:46:52,891 | INFO | Validation Loss: 0.4883 | CE: 0.5536 | Focal: 0.4230 | Acc: 85.23% | LR: 1.00e-04
+2025-10-02 04:48:52,078 | INFO | 
+--- Epoch 147 finished: Avg Loss: 0.0758, Avg Acc: 96.77% ---
+2025-10-02 04:48:52,078 | INFO | [Train] acc=96.77% | mean_conf=0.961 | mean_entropy=0.122
+[Train] pred_hist: 0: 170 (28.9%) | 1: 152 (25.9%) | 2: 114 (19.4%) | 3: 152 (25.9%)
+[Train] per-class acc: 0: 98.8% | 1: 98.6% | 2: 88.1% | 3: 100.0%
+2025-10-02 04:49:02,633 | INFO | [Val] acc=84.09% | mean_conf=0.937 | mean_entropy=0.167
+[Val] pred_hist: 0: 18 (20.5%) | 1: 10 (11.4%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:49:02,633 | INFO | Validation Loss: 0.4927 | CE: 0.5554 | Focal: 0.4300 | Acc: 84.09% | LR: 1.00e-04
+2025-10-02 04:51:01,175 | INFO | 
+--- Epoch 148 finished: Avg Loss: 0.0678, Avg Acc: 96.43% ---
+2025-10-02 04:51:01,175 | INFO | [Train] acc=96.43% | mean_conf=0.954 | mean_entropy=0.140
+[Train] pred_hist: 0: 155 (26.4%) | 1: 160 (27.2%) | 2: 130 (22.1%) | 3: 143 (24.3%)
+[Train] per-class acc: 0: 97.9% | 1: 100.0% | 2: 87.6% | 3: 100.0%
+2025-10-02 04:51:12,009 | INFO | [Val] acc=84.09% | mean_conf=0.931 | mean_entropy=0.174
+[Val] pred_hist: 0: 12 (13.6%) | 1: 11 (12.5%) | 2: 32 (36.4%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 63.6% | 2: 83.9% | 3: 100.0%
+2025-10-02 04:51:12,009 | INFO | Validation Loss: 0.5855 | CE: 0.6370 | Focal: 0.5339 | Acc: 84.09% | LR: 1.00e-04
+2025-10-02 04:53:22,743 | INFO | 
+--- Epoch 149 finished: Avg Loss: 0.0468, Avg Acc: 96.43% ---
+2025-10-02 04:53:22,743 | INFO | [Train] acc=96.43% | mean_conf=0.953 | mean_entropy=0.135
+[Train] pred_hist: 0: 166 (28.2%) | 1: 139 (23.6%) | 2: 147 (25.0%) | 3: 136 (23.1%)
+[Train] per-class acc: 0: 98.7% | 1: 100.0% | 2: 88.4% | 3: 100.0%
+2025-10-02 04:53:33,339 | INFO | [Val] acc=87.50% | mean_conf=0.956 | mean_entropy=0.117
+[Val] pred_hist: 0: 13 (14.8%) | 1: 12 (13.6%) | 2: 30 (34.1%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 84.6% | 1: 63.6% | 2: 83.9% | 3: 100.0%
+2025-10-02 04:53:33,339 | INFO | Validation Loss: 0.6431 | CE: 0.6893 | Focal: 0.5970 | Acc: 87.50% | LR: 1.00e-04
+2025-10-02 04:53:33,353 | INFO | \u2705 New best model saved: Medium_v3.3_87.50.pth
+2025-10-02 04:55:33,162 | INFO | 
+--- Epoch 150 finished: Avg Loss: 0.0628, Avg Acc: 97.28% ---
+2025-10-02 04:55:33,163 | INFO | [Train] acc=97.28% | mean_conf=0.969 | mean_entropy=0.093
+[Train] pred_hist: 0: 131 (22.3%) | 1: 157 (26.7%) | 2: 142 (24.1%) | 3: 158 (26.9%)
+[Train] per-class acc: 0: 96.2% | 1: 99.3% | 2: 93.2% | 3: 100.0%
+2025-10-02 04:55:43,999 | INFO | [Val] acc=81.82% | mean_conf=0.926 | mean_entropy=0.188
+[Val] pred_hist: 0: 20 (22.7%) | 1: 6 (6.8%) | 2: 29 (33.0%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 92.3% | 1: 36.4% | 2: 74.2% | 3: 100.0%
+2025-10-02 04:55:43,999 | INFO | Validation Loss: 0.5399 | CE: 0.6129 | Focal: 0.4669 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 04:57:42,764 | INFO | 
+--- Epoch 151 finished: Avg Loss: 0.1289, Avg Acc: 94.90% ---
+2025-10-02 04:57:42,765 | INFO | [Train] acc=94.90% | mean_conf=0.952 | mean_entropy=0.138
+[Train] pred_hist: 0: 141 (24.0%) | 1: 166 (28.2%) | 2: 141 (24.0%) | 3: 140 (23.8%)
+[Train] per-class acc: 0: 95.4% | 1: 96.4% | 2: 88.7% | 3: 99.3%
+2025-10-02 04:57:53,195 | INFO | [Val] acc=65.91% | mean_conf=0.923 | mean_entropy=0.202
+[Val] pred_hist: 0: 18 (20.5%) | 1: 31 (35.2%) | 2: 6 (6.8%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 61.5% | 1: 100.0% | 2: 19.4% | 3: 100.0%
+2025-10-02 04:57:53,195 | INFO | Validation Loss: 0.9072 | CE: 1.0781 | Focal: 0.7362 | Acc: 65.91% | LR: 1.00e-04
+2025-10-02 04:59:49,926 | INFO | 
+--- Epoch 152 finished: Avg Loss: 0.1244, Avg Acc: 93.03% ---
+2025-10-02 04:59:49,927 | INFO | [Train] acc=93.03% | mean_conf=0.922 | mean_entropy=0.216
+[Train] pred_hist: 0: 156 (26.5%) | 1: 170 (28.9%) | 2: 119 (20.2%) | 3: 143 (24.3%)
+[Train] per-class acc: 0: 95.7% | 1: 99.4% | 2: 77.2% | 3: 100.0%
+2025-10-02 05:00:01,591 | INFO | [Val] acc=84.09% | mean_conf=0.919 | mean_entropy=0.196
+[Val] pred_hist: 0: 11 (12.5%) | 1: 10 (11.4%) | 2: 34 (38.6%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 53.8% | 1: 63.6% | 2: 87.1% | 3: 100.0%
+2025-10-02 05:00:01,591 | INFO | Validation Loss: 0.6449 | CE: 0.7028 | Focal: 0.5870 | Acc: 84.09% | LR: 1.00e-04
+2025-10-02 05:02:22,936 | INFO | 
+--- Epoch 153 finished: Avg Loss: 0.0318, Avg Acc: 98.30% ---
+2025-10-02 05:02:22,936 | INFO | [Train] acc=98.30% | mean_conf=0.969 | mean_entropy=0.101
+[Train] pred_hist: 0: 144 (24.5%) | 1: 172 (29.3%) | 2: 128 (21.8%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 99.3% | 1: 100.0% | 2: 93.4% | 3: 100.0%
+2025-10-02 05:02:33,532 | INFO | [Val] acc=85.23% | mean_conf=0.935 | mean_entropy=0.163
+[Val] pred_hist: 0: 17 (19.3%) | 1: 11 (12.5%) | 2: 27 (30.7%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 72.7% | 2: 77.4% | 3: 100.0%
+2025-10-02 05:02:33,532 | INFO | Validation Loss: 0.4701 | CE: 0.5494 | Focal: 0.3907 | Acc: 85.23% | LR: 1.00e-04
+2025-10-02 05:04:47,089 | INFO | 
+--- Epoch 154 finished: Avg Loss: 0.1285, Avg Acc: 93.37% ---
+2025-10-02 05:04:47,089 | INFO | [Train] acc=93.37% | mean_conf=0.943 | mean_entropy=0.158
+[Train] pred_hist: 0: 155 (26.4%) | 1: 151 (25.7%) | 2: 141 (24.0%) | 3: 141 (24.0%)
+[Train] per-class acc: 0: 97.1% | 1: 97.2% | 2: 81.2% | 3: 100.0%
+2025-10-02 05:04:57,709 | INFO | [Val] acc=81.82% | mean_conf=0.918 | mean_entropy=0.200
+[Val] pred_hist: 0: 13 (14.8%) | 1: 12 (13.6%) | 2: 31 (35.2%) | 3: 32 (36.4%)
+[Val] per-class acc: 0: 53.8% | 1: 81.8% | 2: 77.4% | 3: 97.0%
+2025-10-02 05:04:57,709 | INFO | Validation Loss: 0.4286 | CE: 0.4994 | Focal: 0.3579 | Acc: 81.82% | LR: 1.00e-04
+2025-10-02 05:06:52,780 | INFO | 
+--- Epoch 155 finished: Avg Loss: 0.0808, Avg Acc: 95.41% ---
+2025-10-02 05:06:52,780 | INFO | [Train] acc=95.41% | mean_conf=0.939 | mean_entropy=0.167
+[Train] pred_hist: 0: 161 (27.4%) | 1: 151 (25.7%) | 2: 132 (22.4%) | 3: 144 (24.5%)
+[Train] per-class acc: 0: 98.6% | 1: 98.7% | 2: 85.3% | 3: 99.3%
+2025-10-02 05:07:03,343 | INFO | [Val] acc=88.64% | mean_conf=0.937 | mean_entropy=0.166
+[Val] pred_hist: 0: 12 (13.6%) | 1: 12 (13.6%) | 2: 31 (35.2%) | 3: 33 (37.5%)
+[Val] per-class acc: 0: 76.9% | 1: 72.7% | 2: 87.1% | 3: 100.0%
+2025-10-02 05:07:03,343 | INFO | Validation Loss: 0.5403 | CE: 0.5896 | Focal: 0.4909 | Acc: 88.64% | LR: 1.00e-04
+2025-10-02 05:07:03,352 | INFO | \u2705 New best model saved: Medium_v3.3_88.64.pth

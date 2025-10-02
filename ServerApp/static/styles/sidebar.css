@@ -1,0 +1,102 @@
+.series-list {
+    position: fixed;
+    top: 0;
+    left: -300px;
+    width: 280px;
+    height: 100vh;
+    background: linear-gradient(135deg, #abd1c6 0%, #e1d5b5 100%);
+    overflow-y: auto;
+    transition: left 0.3s ease;
+    z-index: 1000;
+    box-shadow: 2px 0 15px rgba(0, 0, 0, 0.3);
+    padding: 0;
+    box-sizing: border-box;
+}
+
+.series-list.active {
+    left: 0;
+}
+
+.series-list-header {
+    background: #312F2c;
+    padding: 1.5rem 1rem;
+    color: white;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 2px solid white;
+    position: sticky;
+    top: 0;
+    z-index: 1001;
+}
+
+.series-list-title {
+    font-size: 1.2rem;
+    font-weight: bold;
+    margin: 0;
+}
+
+.close-menu {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: background 0.3s ease;
+}
+
+.close-menu:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.series-content {
+    padding: 1rem;
+}
+
+.series-count {
+    color: #99958c;
+    font-size: 0.9rem;
+    margin-bottom: 1rem;
+    text-align: center;
+}
+
+.series-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.series-button {
+    background: #312f2c1a;
+    border: 1px solid #312f2c7e;
+    color: #312F2c;
+    padding: 0.8rem 1rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    text-align: left;
+    font-size: 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.series-button:hover {
+    background: #99958c37;
+    transform: translateX(5px);
+    border-color: #312F2c;
+}
+
+.series-button::before {
+    content: "📁";
+    font-size: 1.1rem;
+}

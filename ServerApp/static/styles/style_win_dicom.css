@@ -1,0 +1,20 @@
+.seriesContainers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3rem;
+    margin-left: 0;
+    transition: margin-left 0.3s ease, filter 0.3s ease;
+}
+
+.dicom-container {
+    overflow: auto;
+    padding: 3%;
+    background-color: #ECECEC;
+    border-radius: 10px;
+    box-sizing: border-box;
+}
+
+.dicom-info {
+    margin: 1%;
+    font-family: 'Courier New', Courier, monospace;
+}
