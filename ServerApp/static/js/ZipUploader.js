@@ -74,8 +74,8 @@ const ZipUploader = ({
             return;
         }
 
-        if (file.size > 100 * 1024 * 1024) {
-            const msg = 'Файл слишком большой. Максимальный размер: 100MB';
+        if (file.size > 400 * 1024 * 1024) {
+            const msg = 'Файл слишком большой. Максимальный размер: 400MB';
             setErrorMessage(msg);
             onUploadError?.(msg);
             return;
