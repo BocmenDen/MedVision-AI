@@ -1,3 +1,17 @@
+# Демонстрация
+
+1. [Основной сервер](https://med-vision-ai.ru.tuna.am/).
+2. [Запасной сервер](http://77.221.145.108).
+
+Ниже приведены примеры серий КТ-сканов, используемых для обучения и тестирования модели.
+
+| Серия | Диагноз | Метка (label) |
+|-------|---------|---------------|
+| [`TestLoadCanser.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCanser.zip) | Рак | 3 |
+| [`TestLoadCovid19.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCovid19.zip) | COVID-19 | 2 |
+| [`TestLoadCap.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCap.zip) | Пневмония | 1 |
+| [`TestLoadNormal.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadNormal.zip) | Норма | 0 |
+
 # *Назначение*
 Система для просмотра и автоматической классификации заболеваний легких по 3D сканам Компьютерной томографии(далее КТ) с использованием нейросети(далее планируется развить до нейросетевой системы) гибридной архитектуры 2.5D CNN + Transformer.
 
@@ -57,7 +71,7 @@
 
 При наличии интернет-соединения и работоспособности сервера:
 
-1. [Открыть сайт](https://user233756200-xkdduipr.tunnel.vk-apps.com/). [Запасной сервер](http://77.221.145.108).
+1. [Открыть сайт](https://med-vision-ai.ru.tuna.am/). [Запасной сервер](http://77.221.145.108).
 2. Загрузить ZIP-архив, в котором содержится папка со снимками в формате `.dcm`.
 
 __При отсутствии доступа к серверу проект можно развернуть локально. Инструкция:__
@@ -104,14 +118,3 @@ __При отсутствии доступа к серверу проект мо
 - Поддержка сканов переменной глубины
 - Пакетный ресэмплинг
 - Надежная обработка ошибок при загрузке
-
-# Примеры серий
-
-иже приведены примеры серий КТ-сканов, используемых для обучения и тестирования модели.
-
-| Серия | Диагноз | Метка (label) |
-|-------|---------|---------------|
-| [`TestLoadCanser.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCanser.zip) | Рак | 3 |
-| [`TestLoadCovid19.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCovid19.zip) | COVID-19 | 2 |
-| [`TestLoadCap.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadCap.zip) | Пневмония | 1 |
-| [`TestLoadNormal.zip`](https://github.com/BocmenDen/MedVision-AI/tree/main/DemoData/TestLoadNormal.zip) | Норма | 0 |
